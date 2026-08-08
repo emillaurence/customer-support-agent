@@ -1,7 +1,7 @@
 [project]
 name = "customer-support-agent"
 version = "0.1.0"
-description = "Bookly conversational customer support agent (scaffold)"
+description = "Bookly conversational AI customer support agent"
 requires-python = ">=3.12"
 dependencies = [
     "streamlit>=1.40",

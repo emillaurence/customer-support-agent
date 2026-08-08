@@ -11,7 +11,30 @@ whether a return is allowed, holding a multi-turn workflow together, or writing
 to Bookly's records is not, and it is where a cheaper model's mistakes cost the
 customer something.
 
-Two properties matter more than the exact keywords:
+Which turns go where:
+
+* **Haiku** — simple, read-only interactions. A policy question, an order
+  status, a greeting. Nothing is decided and nothing is written.
+* **Sonnet** — returns and refunds, ambiguity the agent has to resolve,
+  state-changing actions, escalation, and any conversation that has grown long
+  enough to be carrying real context.
+
+**The asymmetry is the design.** The two ways to be wrong do not cost the same.
+
+* A *false promotion* — sending a simple question to Sonnet — costs a fraction
+  of a cent and a little latency. The customer gets a correct answer from a
+  stronger model than they needed.
+* A *false demotion* — sending a return, an ambiguous reference, or a
+  half-finished workflow to Haiku — risks a wrong eligibility explanation, a
+  dropped thread, or a confident answer about a record the agent should have
+  reasoned harder about. That is the failure a customer actually notices.
+
+So every rule below is written to promote when uncertain. The keyword lists are
+deliberately broad and the state checks come first: a turn only reaches the
+Haiku default by failing every reason to be on Sonnet. Over-promotion is the
+expected, accepted cost of that.
+
+Two properties follow from it:
 
 * **Deterministic.** The same state and the same message always route the same
   way, so a demo behaves the same twice and a test can assert on it.
@@ -95,8 +118,10 @@ def select_model(state: SessionState, user_message: str) -> ModelDecision:
         user_message: What the customer just said.
 
     Returns:
-        The tier and the reason it was chosen. Never raises: an unroutable
-        message is a Haiku message.
+        The tier and the reason it was chosen. Never raises: a message that
+        matches nothing is a simple message, and gets Haiku. Every genuinely
+        uncertain case is caught by one of the checks above that default,
+        because a false promotion is cheaper than a false demotion.
     """
     text = f" {user_message.lower().strip()} "
 
