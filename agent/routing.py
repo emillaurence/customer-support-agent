@@ -66,6 +66,11 @@ RETURN_KEYWORDS: tuple[str, ...] = (
     "return", "refund", "money back", "send it back", "send this back",
     "exchange", "replace", "replacement", "damaged", "faulty", "broken",
     "defective", "wrong item", "cancel my order", "rma",
+    # Return intent with none of the vocabulary. "I don't want it anymore" is a
+    # customer opening a return; it just doesn't say so in the word the list
+    # was built around.
+    "don't want it", "dont want it", "do not want it", "no longer want",
+    "take it back",
 )
 """Anything that could open or continue a return. Matched as substrings."""
 
@@ -100,6 +105,13 @@ class ModelDecision(BaseModel):
 
     tier: ModelTier
     reason: str
+    return_intent: bool = False
+    """Whether this turn was promoted because the customer asked about a return.
+
+    Recorded on the session by the orchestrator, so the turns that follow stay on
+    Sonnet while the customer is still picking which book they mean — see
+    `SessionState.return_intent_expressed`.
+    """
 
     @property
     def is_sonnet(self) -> bool:
@@ -142,7 +154,9 @@ def select_model(state: SessionState, user_message: str) -> ModelDecision:
     # --- Message: intent that needs reasoning or will change records -------
 
     if _mentions(text, RETURN_KEYWORDS):
-        return ModelDecision(tier=ModelTier.SONNET, reason="return or refund intent")
+        return ModelDecision(
+            tier=ModelTier.SONNET, reason="return or refund intent", return_intent=True
+        )
 
     if _mentions(text, ESCALATION_KEYWORDS):
         return ModelDecision(tier=ModelTier.SONNET, reason="escalation intent")

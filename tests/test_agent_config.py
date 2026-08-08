@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from agent.config import REQUIRED_ENV, AnthropicConfigError, load_anthropic_config
+from agent.config import (
+    REQUIRED_ENV,
+    TEMPERATURE_ENV,
+    AnthropicConfigError,
+    load_anthropic_config,
+)
 from agent.orchestrator import BooklyAgent
 from agent.routing import ModelDecision, ModelTier
 from agent.state import SessionState
@@ -30,7 +35,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch):
     would pass or fail depending on whose machine it ran on.
     """
     monkeypatch.setattr("agent.config.load_dotenv", lambda *a, **k: None)
-    for name in REQUIRED_ENV:
+    for name in (*REQUIRED_ENV, TEMPERATURE_ENV):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -96,6 +101,99 @@ def test_api_key_is_not_in_the_repr(anthropic_config) -> None:
     assert anthropic_config.api_key not in str(anthropic_config)
 
 
+# --- Temperature ---------------------------------------------------------
+
+
+@pytest.fixture
+def configured(monkeypatch):
+    """Set the three required variables, leaving the temperature to the test."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    monkeypatch.setenv("ANTHROPIC_MODEL_HAIKU", "fast")
+    monkeypatch.setenv("ANTHROPIC_MODEL_SONNET", "capable")
+
+
+def test_temperature_is_unset_by_default(clean_env, configured) -> None:
+    """No variable, no temperature. The model manages its own sampling."""
+    assert load_anthropic_config().temperature is None
+
+
+def test_temperature_is_read_from_the_environment(clean_env, configured, monkeypatch) -> None:
+    """A deployment on a model that accepts one sets it in `.env`."""
+    monkeypatch.setenv(TEMPERATURE_ENV, "0.7")
+    assert load_anthropic_config().temperature == 0.7
+
+
+def test_zero_is_a_setting_not_an_absence(clean_env, configured, monkeypatch) -> None:
+    """`0` must survive as 0 — the falsiest value the setting can hold."""
+    monkeypatch.setenv(TEMPERATURE_ENV, "0")
+    assert load_anthropic_config().temperature == 0.0
+
+
+def test_blank_temperature_is_treated_as_unset(clean_env, configured, monkeypatch) -> None:
+    """`ANTHROPIC_TEMPERATURE=` in a half-filled `.env` is not a setting."""
+    monkeypatch.setenv(TEMPERATURE_ENV, "   ")
+    assert load_anthropic_config().temperature is None
+
+
+def test_unparseable_temperature_fails_loudly(clean_env, configured, monkeypatch) -> None:
+    """A typo is a startup error, not a silent fallback that looks deliberate."""
+    monkeypatch.setenv(TEMPERATURE_ENV, "warm")
+
+    with pytest.raises(AnthropicConfigError, match=TEMPERATURE_ENV):
+        load_anthropic_config()
+
+
+def test_no_temperature_is_sent_when_none_is_configured(make_agent) -> None:
+    """The parameter is absent from the request, not sent as a default.
+
+    This is the whole point of the None: a model that manages its own sampling
+    rejects an explicit temperature outright, so sending 0 would fail every turn
+    rather than quietly doing nothing.
+    """
+    agent, client = make_agent(text("Ebooks aren't returnable."), text("Let me check that."))
+    state = SessionState()
+
+    agent.respond(state, "what's your policy on ebooks?")
+    agent.respond(state, "I'd like a refund")
+
+    assert client.models_used == ["test-haiku-model", "test-sonnet-model"]
+    assert all("temperature" not in call for call in client.calls)
+
+
+def test_both_tiers_are_sent_the_same_temperature(anthropic_config, make_agent) -> None:
+    """When one is configured: one value, both models, every call.
+
+    A Haiku turn and a Sonnet turn in one conversation. There is one exit from
+    the loop to Anthropic, so there is nowhere for a turn to be sampled
+    differently — this pins that down.
+    """
+    agent, client = make_agent(text("Ebooks aren't returnable."), text("Let me check that."))
+    agent.config = anthropic_config.model_copy(update={"temperature": 0.4})
+    state = SessionState()
+
+    agent.respond(state, "what's your policy on ebooks?")
+    agent.respond(state, "I'd like a refund")
+
+    assert client.models_used == ["test-haiku-model", "test-sonnet-model"]
+    assert [call["temperature"] for call in client.calls] == [0.4, 0.4]
+
+
+def test_a_configured_zero_is_actually_sent(anthropic_config, make_agent) -> None:
+    """0 is a value, not an absence — it must not be dropped as falsy."""
+    agent, client = make_agent(text("hello"))
+    agent.config = anthropic_config.model_copy(update={"temperature": 0.0})
+
+    agent.respond(SessionState(), "hi")
+
+    assert client.calls[0]["temperature"] == 0.0
+
+
+def test_temperature_is_not_hardcoded_in_the_loop() -> None:
+    """The orchestrator reads it from the config, and nowhere else."""
+    source = (ROOT / "agent" / "orchestrator.py").read_text()
+    assert "self.config.temperature" in source
+
+
 # --- Both paths work -----------------------------------------------------
 
 
@@ -145,14 +243,24 @@ def test_no_model_id_is_hardcoded_in_application_code() -> None:
 
 
 def test_env_example_documents_both_models() -> None:
-    """`.env.example` is the contract — it has to name every required variable."""
+    """`.env.example` is the contract — it has to name every variable."""
     example = (ROOT / ".env.example").read_text()
-    for name in (*REQUIRED_ENV, "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"):
+    for name in (
+        *REQUIRED_ENV,
+        TEMPERATURE_ENV,
+        "NEO4J_URI",
+        "NEO4J_USERNAME",
+        "NEO4J_PASSWORD",
+    ):
         assert f"{name}=" in example
 
 
 def test_env_example_ships_no_values() -> None:
-    """Every key is blank. A committed `.env.example` must never carry a secret."""
+    """Every key is blank. A committed `.env.example` must never carry a secret.
+
+    The temperature is blank too, and not because it is a secret: leaving it
+    unset is the working configuration, so a copied `.env` starts correct.
+    """
     for line in (ROOT / ".env.example").read_text().splitlines():
-        if "=" in line:
+        if "=" in line and not line.lstrip().startswith("#"):
             assert line.split("=", 1)[1] == "", f"{line} has a value committed"
