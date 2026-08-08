@@ -77,6 +77,7 @@ tool fails. It never degrades to a fixture or returns a mocked decision.
 | [agent/state.py](agent/state.py) | `SessionState` — the only thing carried between turns |
 | [agent/models.py](agent/models.py) | Typed domain models mirroring the fixtures |
 | [tools/](tools/) | The six tools, plus `fixtures.py` (mock data access) and `eligibility_tokens.py` (token store) |
+| [tools/policy_rules.py](tools/policy_rules.py) | The one policy-selection mechanism: region normalization, applicability, precedence, rule paths — shared by both policy tools |
 | [agent/graph.py](agent/graph.py) | The required Neo4j connection and the one policy query; raises when it is missing |
 | [agent/demo.py](agent/demo.py) | The one reset the script and the UI button share |
 | [scripts/reset_demo.py](scripts/reset_demo.py) | `python scripts/reset_demo.py` — the command line around it |
@@ -116,6 +117,26 @@ sees it: the model learns the decision, never the credential behind it.
 The first answers "can ebooks be returned" without an order. The second answers
 "can I return *this*" and is the only thing that decides, and the only thing that
 issues a token.
+
+They are, however, the same *policy selection*. Region applicability, category
+applicability, precedence, and overrides all come from
+[tools/policy_rules.py](tools/policy_rules.py), which both tools read; the tools
+differ only in presentation — one describes, one decides. Two implementations of
+"which policy governs Australia" is two answers, and one of them is wrong.
+
+### Which region a policy question is about
+
+Fixed precedence, resolved in Python before the tool runs:
+
+1. a region named in the **current question** — "for Australian customers" → `AU`;
+2. the **verified customer's** region, from trusted session state;
+3. no region at all, i.e. global policy context.
+
+Session state is a fallback, never an override: a verified UK customer asking
+about Australian policy is asking about Australia. Names and codes are normalized
+from a table in `policy_rules` (`Australia`/`Australian`/`AU` → `AU`,
+`United Kingdom`/`UK`/`GB` → `GB`), so the country code is never something the
+model invents.
 
 ### How eligibility picks a policy
 

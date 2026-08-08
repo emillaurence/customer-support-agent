@@ -3,12 +3,16 @@
 The one place the return rules are applied. The agent reports what this returns;
 it does not reason about windows, regions, or promotions itself.
 
-Neo4j holds the policies. This tool reads them, keeps only the ones whose
-conditions the order and customer actually satisfy, and lets the highest
+Neo4j holds the policies. `tools.policy_rules` reads them, keeps only the ones
+whose conditions the order and customer actually satisfy, and lets the highest
 precedence survivor decide. That filter-then-rank order is the whole design:
 `AU_BOOKLY_EXTENDED_RETURN` has a higher precedence than `STANDARD_30_DAY`, but a
 customer in the UK must never be given it, so precedence is only consulted among
 policies that already apply.
+
+That selection is *shared* with `search_policy` rather than repeated here, so an
+informational answer about Australia and a decision about an Australian
+customer's order cannot disagree about which policy governs.
 
 Neo4j is required. With no graph there is no decision to report, and a guess is
 worse than an error.
@@ -16,13 +20,13 @@ worse than an error.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
-from agent.graph import fetch_policies_for_category
 from agent.models import EligibilityDecision, Order, Policy, ReturnStatus
 from tools import eligibility_tokens, fixtures
 from tools.lookup_order import find_line_item, lookup_order
-from tools.search_policy import build_rule_path
+from tools.policy_rules import PolicyContext, build_rule_path, policy_candidates
+from tools.policy_rules import policy_applies as _policy_applies_in_context
 
 BLOCKING_RETURN_STATUSES = frozenset(
     {ReturnStatus.REQUESTED, ReturnStatus.APPROVED, ReturnStatus.COMPLETED}
@@ -156,10 +160,10 @@ def applicable_policies(
 ) -> list[tuple[Policy, str | None, list[str]]]:
     """The policies that govern this category *and* apply to this order.
 
-    Reads every policy on the category, drops the ones whose conditions are not
-    met, and ranks what is left by precedence. Dropping before ranking is the
-    guard that keeps a regional policy regional and a promotional policy
-    promotional.
+    A thin adapter over `policy_rules.policy_candidates`: the same read, the same
+    applicability test, and the same precedence order that `search_policy` uses,
+    narrowed to what a decision may rest on. Keeping the selection in one place is
+    what makes the informational and the decision path agree.
 
     Args:
         product_type: The item's category name.
@@ -173,19 +177,12 @@ def applicable_policies(
     Raises:
         PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
     """
-    applicable: list[tuple[Policy, str | None, list[str]]] = []
-
-    for row in fetch_policies_for_category(product_type):
-        policy = Policy.model_validate(row["policy"])
-        regions = [code for code in row["granted_to_regions"] if code]
-        outranks = [policy_id for policy_id in row["outranks"] if policy_id]
-
-        if not policy_applies(policy, regions, order, customer_region):
-            continue
-        applicable.append((policy, regions[0] if regions else None, outranks))
-
-    applicable.sort(key=lambda entry: entry[0].precedence, reverse=True)
-    return applicable
+    context = PolicyContext.for_order(order, customer_region)
+    return [
+        (candidate.policy, candidate.granted_by_region, candidate.outranks)
+        for candidate in policy_candidates(product_type, context)
+        if candidate.applies
+    ]
 
 
 def policy_applies(
@@ -193,17 +190,9 @@ def policy_applies(
 ) -> bool:
     """Whether a policy's conditions are satisfied by this order and customer.
 
-    Two kinds of condition, both read off the graph rather than hardcoded:
-
-    * A policy reached through `(:Region)-[:HAS_OVERRIDE]->(:Policy)` is offered
-      to that region only. This is what stops a UK customer being handed
-      `AU_BOOKLY_EXTENDED_RETURN` on the strength of its precedence.
-    * A policy carrying a `promotion_code` is offered only to orders placed under
-      that promotion, and only if the order was placed inside the promotion's
-      active dates. The extension is not a blanket 60 days for everyone.
-
-    A policy with neither condition — the default, `STANDARD_30_DAY` — always
-    applies to its category.
+    The rules themselves live in `policy_rules.policy_applies`, which both policy
+    tools share; this states them in terms of an order. See that function for why
+    a regional policy stays regional and a promotional one stays promotional.
 
     Args:
         policy: The policy under test.
@@ -214,27 +203,9 @@ def policy_applies(
     Returns:
         True if the policy may be considered for this order.
     """
-    if granted_to_regions and customer_region not in granted_to_regions:
-        return False
-
-    if policy.promotion_code:
-        if order.promotion_code != policy.promotion_code:
-            return False
-        if not _promotion_covers(policy, order.placed_at):
-            return False
-
-    return True
-
-
-def _promotion_covers(policy: Policy, placed_at: date) -> bool:
-    """Whether the order was placed inside the promotion's active window.
-
-    A missing date on either end means the promotion cannot be shown to cover
-    anything, so it does not apply. Absent data is never read as permission.
-    """
-    if policy.promotion_active_from is None or policy.promotion_active_to is None:
-        return False
-    return policy.promotion_active_from <= placed_at <= policy.promotion_active_to
+    return _policy_applies_in_context(
+        policy, granted_to_regions, PolicyContext.for_order(order, customer_region)
+    )
 
 
 def _existing_return(order_id: str, item_id: str):

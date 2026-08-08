@@ -167,6 +167,27 @@ def test_non_au_customer_never_gets_the_au_policy_live() -> None:
     assert "AU_BOOKLY_EXTENDED_RETURN" in au
 
 
+def test_informational_and_eligibility_agree_on_australia_live(now: datetime) -> None:
+    """The Australia regression, against the real database rather than the stub.
+
+    The informational answer and the decision are selected by the same mechanism,
+    so if they ever disagree about which policy governs an AU physical book, they
+    disagree here first.
+    """
+    informational = search_policy(
+        "what is the return policy for Australian customers?", product_type="PhysicalBook"
+    )
+    decision = check_return_eligibility("ORD-1003", "ITEM-102", "CUST-002", now=now)
+
+    assert informational.region == "AU"
+    assert informational.region_policy_found is True
+    assert informational.resolved.policy_id == decision.policy_id == "AU_BOOKLY_EXTENDED_RETURN"
+    assert informational.resolved.return_window_days == 45
+    assert informational.resolved.rule_path == decision.rule_path
+    assert decision.eligible is True
+    assert decision.days_remaining == 11
+
+
 def test_rule_path_reflects_the_live_traversal(now: datetime) -> None:
     decision = check_return_eligibility("ORD-1003", "ITEM-102", "CUST-002", now=now)
     assert "(AU)-[:HAS_OVERRIDE]->(AU_BOOKLY_EXTENDED_RETURN)" in decision.rule_path

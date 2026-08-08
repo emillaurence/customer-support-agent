@@ -140,16 +140,17 @@ def policy_rows_for_category(product_type: str) -> list[dict[str, Any]]:
 
 
 def _policy_reading_modules() -> list[Any]:
-    """The two modules holding a reference to `fetch_policies_for_category`.
+    """The modules holding a reference to `fetch_policies_for_category`.
+
+    One, now: `tools.policy_rules` is the single read of the policy graph, and
+    both policy tools go through it. Patching there covers both, and a tool that
+    grew its own graph read would no longer be stubbed — which is the point.
 
     Fetched from `sys.modules` by name. `tools/__init__` re-exports each tool
     *function* under its module's name, so `tools.search_policy` is the function
     and a plain `import ... as` would hand back the wrong object.
     """
-    return [
-        importlib.import_module(f"tools.{name}")
-        for name in ("check_return_eligibility", "search_policy")
-    ]
+    return [importlib.import_module("tools.policy_rules")]
 
 
 def break_policy_graph(monkeypatch: pytest.MonkeyPatch) -> None:

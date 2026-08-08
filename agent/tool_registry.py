@@ -47,6 +47,7 @@ from tools import (
     search_policy,
     verify_identity,
 )
+from tools.policy_rules import resolve_region
 
 # --- What comes back from a call ----------------------------------------
 
@@ -126,16 +127,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "search_policy",
         "description": (
             "Look up Bookly's return policy. Use this for questions about the rules in "
-            "general — what the window is, whether ebooks can be returned. It does not look "
-            "at an order and does not decide whether a specific return is allowed; use "
-            "check_return_eligibility for that. Works without verification."
+            "general — what the window is, whether ebooks can be returned, what applies in a "
+            "particular country. It does not look at an order and does not decide whether a "
+            "specific return is allowed; use check_return_eligibility for that. Works without "
+            "verification. The region is worked out for you from the question and the account, "
+            "so pass the customer's wording through in `query` and answer from `resolved` and "
+            "`region_note` in the result — never from your own knowledge of a country's rules."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The customer's question about the rules, in their own words.",
+                    "description": (
+                        "The customer's question about the rules, in their own words, "
+                        "including any country they named."
+                    ),
                 },
                 "product_type": {
                     "type": "string",
@@ -399,11 +406,21 @@ def _search_policy(args: dict, state: SessionState, now: datetime | None) -> Too
     used: dict[str, Any] = {"query": args["query"]}
     if args.get("product_type"):
         used["product_type"] = args["product_type"]
-    # Region comes from the verified account, never from the model. A customer's
-    # country decides which regional overrides they can be offered, so it is not
-    # something to infer from how they phrased a question.
-    if state.customer_region:
-        used["country"] = state.customer_region
+    # The region is resolved here, deterministically, from the customer's own
+    # words and from trusted session state — never from a country code the model
+    # produced. Precedence is fixed: a region named in *this* question wins, the
+    # verified customer's region is the fallback, and no region means global
+    # context. See `policy_rules.resolve_region`.
+    #
+    # Session state as an override rather than a fallback was the Australia bug: a
+    # verified GB customer asking about Australian policy had `country=GB`
+    # substituted, which filtered the AU policy out of an AU question and let the
+    # agent answer that Australia has no region-specific policy — while
+    # `check_return_eligibility` was applying the AU 45-day window on the same
+    # account.
+    region = resolve_region(args["query"], state.customer_region)
+    if region:
+        used["country"] = region
     return _ok(search_policy(**used), used)
 
 
@@ -569,4 +586,13 @@ def apply_to_state(
         state.clear_return_context()
 
     elif name == "escalate_to_human":
-        state.escalated = True
+        # Escalation state follows a case that was actually created, and nothing
+        # else. Not an ambiguous or failed policy lookup, not a complex question,
+        # not the tier the router picked, and not the agent merely *offering* to
+        # pass the customer on — an offer is a sentence, and a sentence does not
+        # take the agent out of service. The case id is the evidence: no id, no
+        # escalation. Combined with the caller only reaching here on a successful
+        # call, `escalated` cannot be set without a real handoff.
+        case_id = getattr(payload, "case_id", None)
+        if case_id:
+            state.escalated = True
