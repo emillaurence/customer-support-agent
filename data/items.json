@@ -1,0 +1,44 @@
+[
+  {
+    "item_id": "ITEM-100",
+    "title": "The Pragmatic Programmer",
+    "product_type": "PhysicalBook",
+    "price": 42.0,
+    "currency": "USD"
+  },
+  {
+    "item_id": "ITEM-101",
+    "title": "Designing Data-Intensive Applications",
+    "product_type": "PhysicalBook",
+    "price": 55.0,
+    "currency": "USD"
+  },
+  {
+    "item_id": "ITEM-102",
+    "title": "A Short History of Nearly Everything",
+    "product_type": "PhysicalBook",
+    "price": 24.0,
+    "currency": "USD"
+  },
+  {
+    "item_id": "ITEM-103",
+    "title": "The Midnight Library (hardback)",
+    "product_type": "PhysicalBook",
+    "price": 31.0,
+    "currency": "USD"
+  },
+  {
+    "item_id": "ITEM-200",
+    "title": "Graph Databases (ebook)",
+    "product_type": "EBook",
+    "price": 19.0,
+    "currency": "USD"
+  },
+  {
+    "item_id": "ITEM-201",
+    "title": "Clean Architecture (ebook)",
+    "product_type": "EBook",
+    "price": 24.0,
+    "currency": "USD"
+  }
+]
