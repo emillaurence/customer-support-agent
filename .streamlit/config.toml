@@ -1,0 +1,19 @@
+# Bookly's palette. Streamlit's own theming, so widgets, containers, and
+# expanders pick it up without a stylesheet arguing with them — see ui/theme.py
+# for the small amount of CSS that this cannot express.
+
+[theme]
+base = "light"
+primaryColor = "#1F5C4F"          # Bookly accent: ink green
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F5F1"  # paper, for the sidebar and chat bubbles
+textColor = "#1C2321"
+font = "sans serif"
+
+[client]
+# A stack trace is a developer's tool, not a customer's. Errors reach the
+# customer as a sentence — see app.py — and the detail stays in the trace.
+showErrorDetails = "none"
+
+[browser]
+gatherUsageStats = false

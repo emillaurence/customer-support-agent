@@ -4,10 +4,16 @@ Conversational AI customer support agent with multi-turn workflows, tool use, an
 
 This repo is the **Bookly** support agent — an online bookstore selling physical books and ebooks.
 
-Current state: **the agent talks.** The six deterministic tools are wired to the
-Anthropic Messages API through a hand-written tool loop, with deterministic
-Haiku/Sonnet routing, an enforced confirmation gate, and tool tracing. The
-Streamlit shell is still deliberately plain — the trace UI is the next phase.
+Current state: **the agent handles a whole customer journey, and shows its
+work.** The six deterministic tools are wired to the Anthropic Messages API
+through a hand-written tool loop, with deterministic Haiku/Sonnet routing, an
+enforced confirmation gate, and tool tracing. A customer can ask where their book
+is, be verified, choose between two orders, change their mind and ask for a
+return, and get a real RMA — in one session, with nothing scripted. See
+[Demo](#demo). Under each reply the Streamlit UI shows which model handled the
+turn and a collapsed **Agent trace** for that turn: the tools it ran, in order,
+with real latencies, and the policy and graph path behind any eligibility
+decision. See [The UI](#the-ui).
 
 **Neo4j is a required dependency for policy and return eligibility evaluation.
 JSON is used only for mock transactional data.**
@@ -55,7 +61,12 @@ tool fails. It never degrades to a fixture or returns a mocked decision.
 
 | Path | What it holds |
 | --- | --- |
-| [app.py](app.py) | Minimal Streamlit chat shell |
+| [app.py](app.py) | The Streamlit chat shell — transcript in, one turn out |
+| [ui/format.py](ui/format.py) | Pure display helpers: latency, statuses, sanitized arguments, the rule path |
+| [ui/turns.py](ui/turns.py) | `AssistantTurn` — the mapping from the session's traces to the reply that caused them |
+| [ui/render.py](ui/render.py) | The Streamlit calls: chat, per-turn trace, developer state |
+| [ui/theme.py](ui/theme.py) | Bookly branding: copy, accent colour, and a short stylesheet |
+| [.streamlit/config.toml](.streamlit/config.toml) | The palette, as Streamlit's own theming |
 | [agent/orchestrator.py](agent/orchestrator.py) | The Anthropic tool loop — one turn in, one reply out |
 | [agent/routing.py](agent/routing.py) | Deterministic Haiku/Sonnet selection |
 | [agent/tool_registry.py](agent/tool_registry.py) | Tool schemas, dispatch, and trusted-state updates |
@@ -67,7 +78,10 @@ tool fails. It never degrades to a fixture or returns a mocked decision.
 | [agent/models.py](agent/models.py) | Typed domain models mirroring the fixtures |
 | [tools/](tools/) | The six tools, plus `fixtures.py` (mock data access) and `eligibility_tokens.py` (token store) |
 | [agent/graph.py](agent/graph.py) | The required Neo4j connection and the one policy query; raises when it is missing |
+| [agent/demo.py](agent/demo.py) | The one reset the script and the UI button share |
+| [scripts/reset_demo.py](scripts/reset_demo.py) | `python scripts/reset_demo.py` — the command line around it |
 | [data/](data/) | Mock transactional JSON only: customers, orders, items, returns |
+| [data/seed/](data/seed/) | Pristine copies of the mutable files, for the reset to restore |
 | [neo4j/](neo4j/) | Policy graph seed, ingestion script, reference Cypher |
 | [tests/](tests/) | Unit tests for all six tools, plus a live-Neo4j integration group |
 
@@ -172,6 +186,12 @@ outranks whatever the customer just typed — a mid-workflow "ok" stays on Sonne
 Promotion is one-way within a workflow: cheap to promote, expensive to drop the
 strong model halfway through a return.
 
+A return workflow opens the moment the customer *asks* for one, not once an item
+has been picked. Answering "which one?" with a book title carries no return
+vocabulary at all, and that is usually the turn the eligibility check runs on —
+so the intent is recorded on the session (`return_intent_expressed`) and cleared
+when the return context is.
+
 Neither model id appears in the code. `ANTHROPIC_MODEL_HAIKU` and
 `ANTHROPIC_MODEL_SONNET` are both required, and a test scans `agent/`, `tools/`,
 and `app.py` to keep it that way.
@@ -215,12 +235,68 @@ two active orders the tools leave it nothing to guess with.
 Every tool call is recorded on the session as a `ToolTrace`: trace id, timestamp,
 session id, model and tier, tool name, sanitized arguments, status, latency, a
 one-line result summary, and any error. Every turn is recorded as a `ModelTurn`
-with the tier, the model id, and the routing reason. Phase 6 renders them; the
+with the tier, the model id, and the routing reason. [ui/](ui/) renders them; the
 loop does not know a UI exists.
 
 Traces record **observable execution, not reasoning**. Nothing carries
 chain-of-thought, the Anthropic key, the Neo4j password, or a spendable
 eligibility token. Email addresses are masked to `a***@example.com`.
+
+## The UI
+
+The conversation is the page. Under each assistant reply there is a badge saying
+which model handled the turn, and one collapsed **Agent trace** describing *that*
+reply:
+
+```
+Model: Sonnet   return or refund intent · 1 tool call
+
+▸ Agent trace
+    Model · Sonnet
+    claude-sonnet-5 — routed because return or refund intent
+
+    check_return_eligibility · 390 ms  [Success]
+    Arguments · order_id=ORD-1001, item_id=ITEM-100, customer_id=CUST-001
+    Result · eligible=True, policy_id=STANDARD_30_DAY, requires_human=False
+    Policy · STANDARD_30_DAY
+    Decision · Eligible
+    Rule path
+      PhysicalBook
+      → STANDARD_30_DAY
+```
+
+Per turn, not one list at the bottom of the page: the point is to connect an
+action to the reply that produced it. Tools appear in execution order, and every
+latency shown is the one `invoke_timed` measured — nothing here is generated for
+the demo.
+
+The rule path is the graph traversal the decision came from: the item's category,
+the region or promotion that made a conditional policy apply, the policy that
+won, and the one it outranked. Showing it is what distinguishes a deterministic
+evaluation from a model's opinion. The Cypher behind it is not shown — the
+traversal is the explanation, the query is an implementation detail.
+
+**What the UI does not show.** No chain-of-thought — none is captured anywhere in
+the repo, so there is none to render. No spendable eligibility token: the
+developer view reports one as `held`, never its value. No API key, no Neo4j
+password, no environment. Customer emails are masked in the trace. And no stack
+traces: an Anthropic outage, an unreachable policy graph, and a failed tool each
+reach the customer as one sentence, with the technical detail left in the trace.
+
+Model routing is visible but quiet — a small badge, never louder than the answer.
+The tier shown is whatever [agent/routing.py](agent/routing.py) decided; the UI
+displays the decision and does not influence it.
+
+Beside the chat, in the sidebar, a collapsed **Developer state** expander shows
+the session's current trusted fields — verified customer, region, active order and
+item, return reason, eligibility, whether a token is held, whether a confirmation
+is outstanding, confirmed, escalated. Separate from the trace, and collapsed,
+because it is a debugging view rather than part of the customer's experience.
+
+`ui/` holds no business logic. It calls no tool, evaluates no policy, chooses no
+model, and writes no trusted field; `agent/` and `tools/` do not import it.
+`ui.turns.capture_turn` slices the session's flat trace list into the turn that
+produced it, which is a presentation mapping rather than a change to the loop.
 
 ## Session state
 
@@ -233,8 +309,8 @@ verify → find the order → pick the item → check eligibility → confirm �
 `messages` and `transcript` (the visible conversation, and the Anthropic one
 with its tool blocks), `verified_customer_id`, `customer_region`,
 `active_order_ids`, `active_order_id`, `active_item_id`, `return_reason`,
-`eligibility`, `eligibility_token`, `pending_return`, `confirmed`, `escalated`,
-plus `tool_traces` and `model_turns`.
+`return_intent_expressed`, `eligibility`, `eligibility_token`, `pending_return`,
+`confirmed`, `escalated`, plus `tool_traces` and `model_turns`.
 
 A write needs all three gates: identity, an eligibility token, and an explicit
 confirmation. Switching order or item clears the token, so it can never be spent
@@ -270,7 +346,7 @@ today is **2026-08-08**.
 
 | Scenario | Customer | Order | Item | Expected |
 | --- | --- | --- | --- | --- |
-| Two active orders | CUST-003 | ORD-1004, ORD-1005 | — | Ask which order |
+| Two active orders | CUST-001, CUST-003 | — | — | Ask which order |
 | Physical book in window (day 11) | CUST-001 | ORD-1001 | ITEM-100 | Eligible, `STANDARD_30_DAY` |
 | Physical book out of window (day 67) | CUST-001 | ORD-1002 | ITEM-101 | Not eligible |
 | Ebook (day 7) | CUST-003 | ORD-1004 | ITEM-200 | Not eligible, `DIGITAL_NO_RETURN` |
@@ -281,6 +357,80 @@ today is **2026-08-08**.
 | Existing RMA (RET-5001) | CUST-002 | ORD-1007 | ITEM-100 | Refuse duplicate |
 | Someone else's order | CUST-004 | ORD-1008 | ITEM-101 | Nothing returned to CUST-001 |
 
+## Demo
+
+**Ada (`ada@example.com`, CUST-001) is the demo customer.** She has two live
+orders, one book inside its return window and one long outside it — so the same
+identity carries both the hero journey and the case where the answer is no.
+Nothing in the code knows that. She is a row in `data/customers.json`, and the
+two outcomes fall out of the dates on her orders.
+
+### The hero journey
+
+One session, five turns, no script:
+
+| Turn | The customer | What happens | Model |
+| --- | --- | --- | --- |
+| 1 | "Where's my book?" | Not verified, so the agent asks for the email | Haiku |
+| 2 | "ada@example.com" | `verify_identity` → two live orders → both looked up → *which one?* | Haiku |
+| 3 | "The Pragmatic Programmer one" | Selected by title; `lookup_order` reads out the status | Haiku |
+| 4 | "Actually, I want to return it." | `check_return_eligibility` → eligible → *shall I start it?* | Sonnet |
+| 5 | "Yes please" | `initiate_return` → a real RMA in `data/returns.json` | Sonnet |
+
+    verify_identity → lookup_order → check_return_eligibility → initiate_return
+
+The wording is not load-bearing. "Can you check my delivery?", "I haven't
+received my book yet", "Can I send this back?", "Can I get a refund?", "Go
+ahead" all reach the same places — there is no phrase table anywhere, and
+[tests/test_hero_flow.py](tests/test_hero_flow.py) holds the alternatives to
+keep it that way.
+
+Three things are worth watching in the traces as it runs:
+
+* **The agent does not guess.** Two live orders means `active_order_id` stays
+  empty until Ada chooses one. Reading both out to build the question is
+  browsing, not selecting — see `_browsing_orders` in
+  [agent/orchestrator.py](agent/orchestrator.py).
+* **Nothing is asked twice.** `verify_identity` runs once. Changing intent from
+  status to return re-uses the verified customer, the region, and the chosen
+  order, and a reason given at the eligibility step is still there at the write.
+* **The router moves on its own.** Turns 1–3 are retrieval. Turn 4 says
+  "return", and from there the session stays on Sonnet until the RMA exists.
+
+### The other ending
+
+Same customer, same tools, different fixture dates:
+
+> "I want to return a book" → "ada@example.com" → "Designing Data-Intensive
+> Applications"
+
+Delivered 67 days ago, so `check_return_eligibility` refuses. No token is
+minted, so there is nothing for a "yes" to authorise, and `initiate_return`
+would refuse on its own if the model asked for it anyway. The agent explains why
+and offers a colleague. `data/returns.json` is untouched.
+
+The UI needs no special case for this: it is the same trace, saying no. The
+policy is named, the same rule path is shown, and the decision reads
+**Not eligible** — which is what makes it clear the refusal was evaluated rather
+than improvised.
+
+### Running it again
+
+```bash
+python scripts/reset_demo.py
+```
+
+Restores `data/returns.json` from `data/seed/` and drops any eligibility tokens
+the process is holding. Idempotent. The **Reset demo** button in the Streamlit
+sidebar calls the same [agent/demo.py](agent/demo.py) function and additionally
+clears the conversation, the session state, and the traces — two copies of "put
+it back" is how a rehearsal and a live run end up starting from different
+places.
+
+Only `returns.json` is restored, because it is the only file anything writes.
+Customers, orders, and items are read-only, and a reset that rewrote them would
+be theatre.
+
 ## Running
 
 ### 1. Configure `.env`
@@ -289,12 +439,14 @@ today is **2026-08-08**.
 cp .env.example .env
 ```
 
-Fill in all six. Every one is required.
+Fill in six of the seven. `ANTHROPIC_TEMPERATURE` is the only optional one, and
+the only one to leave blank.
 
 ```
 ANTHROPIC_API_KEY=
 ANTHROPIC_MODEL_HAIKU=
 ANTHROPIC_MODEL_SONNET=
+ANTHROPIC_TEMPERATURE=
 
 NEO4J_URI=
 NEO4J_USERNAME=
@@ -305,6 +457,22 @@ NEO4J_PASSWORD=
 the cheap one configured would silently run the consequential turns on the wrong
 model, so it refuses to start instead. **All three Neo4j values**, because policy
 decisions have nowhere else to come from.
+
+**`ANTHROPIC_TEMPERATURE` is unset by default, and should stay that way.** A
+support agent should answer the same question the same way, and a demo should
+behave the same way twice — but the way to get that on a current model is to
+send nothing. Sonnet 5 and the rest of the Claude 5 family manage their own
+sampling internally and reject an explicit `temperature` with a 400, so a pinned
+value would fail every turn rather than making anything more deterministic. When
+the variable is blank the parameter is not sent at all.
+
+The setting exists because it is a deployment choice: a deployment running a
+model that does accept a temperature can set one without touching the loop. It
+then applies to **both tiers** — one value, never one per model, because there
+is a single exit from the loop to Anthropic. Either way it reaches only tone;
+business truth and every state-changing action stay with the deterministic tools
+and the guards in front of them. Set to something that is not a number, it is a
+startup error rather than a silent fallback.
 
 No model id is hardcoded in the code. Swapping models is an `.env` edit.
 
@@ -329,9 +497,15 @@ Idempotent. Run it again whenever `neo4j/policy_graph.json` changes.
 streamlit run app.py
 ```
 
-The chat works end to end. The UI is still plain — the agent trace is Phase 6 —
-but the sidebar shows the verified customer, the return workflow, and which
-model handled the last turn and why.
+The chat works end to end, with a per-turn agent trace under each reply — see
+[The UI](#the-ui).
+
+Two resets in the sidebar, and they are not the same thing. **Reset conversation**
+forgets the conversation; the RMA it created is still a real record.
+**Reset demo** also restores `data/returns.json` from `data/seed/` and clears the
+eligibility tokens, which is what makes the [demo](#demo) rehearsable. It calls
+the same `agent.demo.reset_demo` as `python scripts/reset_demo.py`, rather than a
+second copy of the logic.
 
 The tools still work without Anthropic: they are ordinary Python functions, and
 that is what the Phase 3 tests exercise.
@@ -351,6 +525,16 @@ exercised with no network, no API key, and no model non-determinism. What is
 under test is the orchestrator's behaviour given a model's output — not the
 model.
 
+The UI is tested too, at the level worth testing. The display helpers in
+[ui/format.py](ui/format.py) and the trace-to-turn mapping in
+[ui/turns.py](ui/turns.py) are pure functions, so
+[tests/test_ui_presentation.py](tests/test_ui_presentation.py) checks them
+directly. [tests/test_ui_app.py](tests/test_ui_app.py) drives `app.py` itself
+through Streamlit's own `AppTest` — in process, no browser, no server — typing the
+hero flow into the chat box and asserting on what appears under each reply, on
+both reset buttons, and on the absence of an email address or a token in the
+trace. No browser automation.
+
 Unit tests stub the policy graph from `neo4j/policy_graph.json` — the same seed
 that was ingested — so they run offline. The integration group takes no stub and
 re-checks the same decisions against the live database, which is what keeps the
@@ -363,8 +547,6 @@ the real `initiate_return` write leaves no RMA behind.
 
 ## Not built yet
 
-- The polished Streamlit UI and the agent trace rendering (the data is captured)
-- The hero demo conversation
 - Streaming replies, and prompt caching of the system prompt and tool schemas
 - Voice, long-term memory, and a model-evaluation dashboard
 - Production authentication — see below
