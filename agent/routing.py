@@ -19,6 +19,13 @@ Which turns go where:
   state-changing actions, escalation, and any conversation that has grown long
   enough to be carrying real context.
 
+The word "return" is not the signal — the *subject* is. "What is the return
+policy for Australian customers?" and "Can I return my order?" share a keyword
+and nothing else: the first is a policy lookup with no customer in it, the
+second is an eligibility question about a specific record. So the router asks
+which of the two a turn is, and only the second one is a workflow. The trace
+says which: *informational policy lookup* versus *return or refund workflow*.
+
 **The asymmetry is the design.** The two ways to be wrong do not cost the same.
 
 * A *false promotion* — sending a simple question to Sonnet — costs a fraction
@@ -61,6 +68,42 @@ class ModelTier(StrEnum):
     HAIKU = "haiku"
     SONNET = "sonnet"
 
+
+INFORMATIONAL_KEYWORDS: tuple[str, ...] = (
+    "what is", "what's", "whats", "what are", "how long", "how many",
+    "do you allow", "do you accept", "do you offer", "is there a policy",
+    "policy", "policies", "rules", "return window", "refund window",
+    # Questions about a *class* of product rather than the customer's copy of
+    # one. "Can ebooks be returned?" is the policy, asked in the passive voice.
+    "can ebooks", "can e-books", "can digital", "can physical", "can audiobooks",
+    "are ebooks", "are e-books", "are digital", "in general", "generally",
+)
+"""Phrasing that asks what the rules *are*, rather than what happens to an order."""
+
+CUSTOMER_SPECIFIC_KEYWORDS: tuple[str, ...] = (
+    "my order", "my book", "my item", "my purchase", "my return", "my refund",
+    "my case", "my copy", "this order", "this book", "this item", "that order",
+    "return this", "return it", "return mine", "refund me", "refund this",
+    "am i", "can i", "could i", "may i", "do i qualify", "eligible",
+    "eligibility", "i want", "i'd like", "i would like", "i need to",
+    "start the return", "start a return", "start my return", "go ahead",
+    "for me", "was rejected",
+)
+"""First-person, this-order, take-action language. Blocks the Haiku demotion."""
+
+OVERRIDE_KEYWORDS: tuple[str, ...] = (
+    "make an exception", "an exception", "exception", "special case", "waive",
+    "override", "just this once", "bend the rules", "anything you can do",
+)
+"""Asking for the policy *not* to apply.
+
+Its own group because it is the one case where the customer already knows the
+rule. There is nothing to look up — the turn is a judgement about whether to
+depart from the answer, which is the opposite of retrieval.
+"""
+
+ORDER_REFERENCE_PREFIXES: tuple[str, ...] = ("ord-", "item-", "rma-")
+"""Naming a record makes a question about that record, not about the policy."""
 
 RETURN_KEYWORDS: tuple[str, ...] = (
     "return", "refund", "money back", "send it back", "send this back",
@@ -153,10 +196,19 @@ def select_model(state: SessionState, user_message: str) -> ModelDecision:
 
     # --- Message: intent that needs reasoning or will change records -------
 
+    # Asking what the return policy *is* is a read, even though it says
+    # "return". The keyword alone does not decide it — see
+    # `_is_informational_policy_question`.
+    if _is_informational_policy_question(text, state):
+        return ModelDecision(tier=ModelTier.HAIKU, reason="informational policy lookup")
+
     if _mentions(text, RETURN_KEYWORDS):
         return ModelDecision(
-            tier=ModelTier.SONNET, reason="return or refund intent", return_intent=True
+            tier=ModelTier.SONNET, reason="return or refund workflow", return_intent=True
         )
+
+    if _mentions(text, OVERRIDE_KEYWORDS):
+        return ModelDecision(tier=ModelTier.SONNET, reason="request to depart from policy")
 
     if _mentions(text, ESCALATION_KEYWORDS):
         return ModelDecision(tier=ModelTier.SONNET, reason="escalation intent")
@@ -173,6 +225,38 @@ def select_model(state: SessionState, user_message: str) -> ModelDecision:
         )
 
     return ModelDecision(tier=ModelTier.HAIKU, reason="simple read-only request")
+
+
+def _is_informational_policy_question(padded_text: str, state: SessionState) -> bool:
+    """Whether this turn is a question about the rules and nothing more.
+
+    Four conditions, all required. The message has to *ask what the policy is*,
+    and it has to carry none of the signals that would make it about a specific
+    customer's order — so the demotion is only taken on a turn where there is
+    genuinely nothing to decide and nothing to write.
+
+    Written as a veto rather than a match: any customer-specific, escalation, or
+    ambiguity signal keeps the turn on Sonnet, and so does a conversation that is
+    already long enough to be carrying context. That keeps the asymmetry in
+    `select_model` intact — this function can only demote a turn it is sure about.
+
+    Args:
+        padded_text: The lowercased message, space-padded.
+        state: The live session, for the turn-count check.
+    """
+    if _mentions(padded_text, CUSTOMER_SPECIFIC_KEYWORDS):
+        return False
+    if _mentions(padded_text, ORDER_REFERENCE_PREFIXES):
+        return False
+    if _mentions(padded_text, OVERRIDE_KEYWORDS):
+        return False
+    if _mentions(padded_text, ESCALATION_KEYWORDS):
+        return False
+    if _mentions(padded_text, AMBIGUITY_KEYWORDS):
+        return False
+    if state.user_turn_count >= COMPLEX_TURN_COUNT:
+        return False
+    return _mentions(padded_text, INFORMATIONAL_KEYWORDS)
 
 
 def _mentions(padded_text: str, keywords: tuple[str, ...]) -> bool:

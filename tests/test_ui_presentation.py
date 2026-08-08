@@ -251,7 +251,7 @@ def test_capture_records_the_model_that_handled_the_turn() -> None:
             session_id=state.session_id,
             model_tier="sonnet",
             model="test-sonnet-model",
-            routing_reason="return or refund intent",
+            routing_reason="return or refund workflow",
         )
     )
 
@@ -259,7 +259,7 @@ def test_capture_records_the_model_that_handled_the_turn() -> None:
 
     assert turn.model_tier == "sonnet"
     assert turn.model == "test-sonnet-model"
-    assert turn.routing_reason == "return or refund intent"
+    assert turn.routing_reason == "return or refund workflow"
     assert turn.reply == "Shall I start that return?"
 
 

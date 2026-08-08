@@ -280,7 +280,7 @@ def test_hero_flow_routing_is_the_generic_router(
         ModelTier.SONNET,  # "Actually, I want to return it."
         ModelTier.SONNET,  # confirming, with a return pending
     ]
-    assert state.model_turns[3].routing_reason == "return or refund intent"
+    assert state.model_turns[3].routing_reason == "return or refund workflow"
     assert state.model_turns[4].routing_reason == "a return workflow is open"
 
 

@@ -193,14 +193,24 @@ The rule: **Haiku answers, Sonnet acts.**
 
 | Haiku | Sonnet |
 | --- | --- |
-| General policy questions | Return or refund intent |
+| Informational policy lookups | A customer's own return or refund |
 | Straightforward order status | Eligibility evaluation |
 | Simple factual retrieval | Ambiguity needing resolution |
 | | An open return workflow |
 | | Explicit confirmation |
 | | State-changing actions |
+| | Requests to depart from policy |
 | | Escalation |
 | | Long multi-turn context |
+
+The word "return" is not the signal — the *subject* is. "What is the return
+policy for Australian customers?" and "Can I return my order?" share a keyword
+and nothing else: the first is a policy lookup with no customer in it and goes to
+Haiku, the second is an eligibility question about a specific record and goes to
+Sonnet. First-person phrasing, "this order", an order id, an instruction to act,
+or a request for an exception each veto the cheaper model on their own. The trace
+says which rule fired — *informational policy lookup* or *return or refund
+workflow*.
 
 Session state is checked before message text, so an open return workflow
 outranks whatever the customer just typed — a mid-workflow "ok" stays on Sonnet.
