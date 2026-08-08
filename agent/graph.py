@@ -13,6 +13,7 @@ reads it.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase
@@ -77,3 +78,57 @@ def close_driver() -> None:
     if _driver is not None:
         _driver.close()
         _driver = None
+
+
+# --- Policy retrieval ---------------------------------------------------
+#
+# One Cypher query, used by both policy tools. `search_policy` presents the
+# result to a customer as information; `check_return_eligibility` filters it by
+# applicability and decides. Sharing the read keeps the two from drifting into
+# two different ideas of what the graph says, without either owning the other.
+
+CATEGORY_POLICIES = """
+MATCH (category:Category {name: $product_type})-[:GOVERNED_BY]->(policy:Policy)
+OPTIONAL MATCH (region:Region)-[:HAS_OVERRIDE]->(policy)
+OPTIONAL MATCH (policy)-[:OVERRIDES]->(outranked:Policy)
+RETURN category.name           AS category,
+       properties(policy)      AS policy,
+       collect(DISTINCT region.code)        AS granted_to_regions,
+       collect(DISTINCT outranked.policy_id) AS outranks
+ORDER BY policy.precedence DESC, policy.policy_id
+"""
+
+
+def fetch_policies_for_category(product_type: str) -> list[dict[str, Any]]:
+    """Read every policy governing one product category, with its edges.
+
+    The edges come back alongside the properties because they are what makes a
+    policy conditional. `granted_to_regions` non-empty means the policy is only
+    reachable for customers in those regions; `outranks` is what the policy
+    displaces, and is what an explanation is built from.
+
+    Args:
+        product_type: A `:Category` name — 'PhysicalBook' or 'EBook'.
+
+    Returns:
+        One row per policy, highest precedence first. Empty if the category has
+        no policies, or does not exist.
+
+    Raises:
+        PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
+    """
+    records, _, _ = get_driver().execute_query(CATEGORY_POLICIES, product_type=product_type)
+    rows = [record.data() for record in records]
+    for row in rows:
+        row["policy"] = {key: _to_python(value) for key, value in row["policy"].items()}
+    return rows
+
+
+def _to_python(value: Any) -> Any:
+    """Flatten a Neo4j temporal value to something Pydantic can parse.
+
+    The seed stores dates as ISO strings, so this is usually a no-op — but a
+    property written as a Cypher `date()` would come back as a `neo4j.time.Date`,
+    and `Policy` expects a `date`.
+    """
+    return value.to_native() if hasattr(value, "to_native") else value

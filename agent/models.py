@@ -140,7 +140,10 @@ class EligibilityDecision(BaseModel):
     explanation: str = Field(default="", description="Customer-facing. Safe to read aloud verbatim.")
     rule_path: list[str] = Field(
         default_factory=list,
-        description="e.g. ['PhysicalBook', 'GOVERNED_BY', 'STANDARD_30_DAY', 'HAS_WINDOW', 'WINDOW_30_DAY'].",
+        description=(
+            "One string per graph hop, e.g. '(PhysicalBook)-[:GOVERNED_BY]->(AU_BOOKLY_EXTENDED_RETURN)'. "
+            "Includes the region or promotion hop that made a conditional policy apply, and what it outranked."
+        ),
     )
     eligibility_token: str | None = Field(
         default=None,

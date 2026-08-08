@@ -1,5 +1,5 @@
 [project]
-name = "bookly-support-agent"
+name = "customer-support-agent"
 version = "0.1.0"
 description = "Bookly conversational customer support agent (scaffold)"
 requires-python = ">=3.12"
@@ -25,3 +25,6 @@ packages = ["agent", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: runs against a real, seeded Neo4j database. Skipped when it is unreachable. Select with `pytest -m integration`.",
+]
