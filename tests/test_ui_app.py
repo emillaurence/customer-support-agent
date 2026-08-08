@@ -111,6 +111,38 @@ def test_the_developer_state_is_available_and_separate(app) -> None:
     assert "Verified customer" in body(developer[0])
 
 
+def test_the_page_carries_no_implementation_notes(app) -> None:
+    """The customer's screen is the conversation, not the design of the shell."""
+    at = app(text("hello"))
+    page = page_text(at)
+
+    for phrase in (
+        "What the customer sees",
+        "agent.orchestrator",
+        "agent.tool_registry",
+        "stack trace",
+    ):
+        assert phrase not in page
+
+
+def test_the_script_renders_nothing_it_did_not_ask_to() -> None:
+    """Streamlit's magic writes any bare expression at the top level to the page.
+
+    Which makes a module-level string a rendered paragraph, not a note — how a
+    docstring describing the shell's error handling once ended up above the
+    Bookly header. Implementation notes in `app.py` are comments for that reason.
+    """
+    import ast
+
+    body = ast.parse(Path(APP).read_text()).body
+    stray = [
+        node.lineno
+        for node in body[1:]  # the module docstring is not magic
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    ]
+    assert stray == []
+
+
 def test_a_missing_anthropic_configuration_is_an_explanation_not_a_crash(
     monkeypatch, seeded_graph
 ) -> None:
@@ -159,16 +191,23 @@ def test_a_reply_carries_its_own_trace(app) -> None:
     assert "lookup_order" in trace
     assert "ms" in trace or " s" in trace
     assert "Success" in trace
+    # The router's own wording stays in the trace, where it explains the badge.
+    assert "Routing · simple read-only request" in trace
 
 
 def test_the_model_badge_says_which_tier_handled_the_turn(app) -> None:
-    """Routing is visible on the page without opening anything."""
+    """Routing is visible on the page without opening anything.
+
+    Compact, and in the reviewer's language: the tier as a badge, then what the
+    turn was. The router's own reason is not on the page — it is in the trace.
+    """
     at = app(text("What's the email address on your Bookly account?"))
 
     say(at, "Where's my book?")
 
-    assert "Model: Haiku" in page_text(at)
-    assert "simple read-only request" in page_text(at)
+    assert "Haiku" in page_text(at)
+    assert "Support question" in page_text(at)
+    assert "simple read-only request" not in page_text(at)
 
 
 def test_a_turn_with_no_tools_has_no_trace_to_open(app) -> None:
@@ -178,11 +217,11 @@ def test_a_turn_with_no_tools_has_no_trace_to_open(app) -> None:
     say(at, "Where's my book?")
 
     assert traces(at) == []
-    assert "Model: Haiku" in page_text(at)
+    assert "Haiku" in page_text(at)
 
 
 def test_a_shell_failure_reaches_the_customer_as_a_sentence(app, monkeypatch) -> None:
-    """No stack trace, ever — the technical detail is not the customer's problem."""
+    """No stack trace, ever, and no module names — one sentence and a way out."""
     at = app(text("hello"))
 
     class Broken:
@@ -194,9 +233,10 @@ def test_a_shell_failure_reaches_the_customer_as_a_sentence(app, monkeypatch) ->
 
     say(at, "Where's my book?")
 
-    assert "trouble accessing support" in at.error[0].value
+    assert "Something went wrong" in at.error[0].value
     assert not at.exception
     assert "RuntimeError" not in page_text(at)
+    assert "agent.orchestrator" not in page_text(at)
 
 
 # --- The hero flow, in the UI -------------------------------------------
@@ -238,8 +278,8 @@ def test_the_hero_flow_shows_both_tiers_where_the_router_chose_them(
     at = run_hero_flow_in_ui(app(*hero_script))
 
     page = page_text(at)
-    assert "Model: Haiku" in page
-    assert "Model: Sonnet" in page
+    assert "Haiku" in page
+    assert "Sonnet" in page
     assert [turn.model_tier for turn in at.session_state["bookly_turns"]] == [
         "haiku",
         "haiku",
@@ -332,7 +372,7 @@ def test_the_outside_window_case_needs_no_special_display(app) -> None:
     say(at, "Can I send this back?")
 
     shown = body(traces(at)[0])
-    assert "Model: Sonnet" in page_text(at)
+    assert "Sonnet" in page_text(at)
     assert "Not eligible" in shown
     assert "STANDARD_30_DAY" in shown
     assert "→ STANDARD_30_DAY" in shown

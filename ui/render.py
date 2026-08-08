@@ -12,6 +12,12 @@ succeeded, the sanitized arguments, a one-line result, and — for an eligibilit
 check — the policy and the graph path behind the decision. It does not show
 reasoning: no `thinking` content is captured anywhere in this repo, so there is
 none here to render.
+
+Two registers, deliberately. Outside the trace the turn is described the way a
+reader skims it — `Haiku · Policy lookup · 2 tools` — and inside it the router's
+own deterministic reason is printed verbatim, because that is the thing a
+reviewer is checking. Neither is derived from the other: `ui.format` renames a
+recorded reason and never re-decides one.
 """
 
 from __future__ import annotations
@@ -21,14 +27,17 @@ import streamlit as st
 from agent.state import SessionState
 from agent.tracing import ToolStatus, ToolTrace
 from ui.format import (
+    activity_label,
     decision_label,
     format_args,
     format_latency,
     format_rule_path,
     status_label,
+    status_mark,
     tier_label,
+    tool_count_label,
 )
-from ui.theme import BRAND_NAME, BRAND_TAGLINE, CSS, WELCOME_MESSAGE
+from ui.theme import BRAND_NAME, BRAND_STATUS, BRAND_TAGLINE, CSS, WELCOME_MESSAGE
 from ui.turns import AssistantTurn
 
 TRACE_LABEL = "Agent trace"
@@ -55,11 +64,14 @@ def apply_branding() -> None:
 
 
 def render_header() -> None:
-    """The Bookly title and one line saying what the agent can do."""
+    """The Bookly title, a quiet status, and one line saying what the agent does."""
     st.markdown(
         f"""
         <div class="bookly-header">
-          <h1><span class="mark">📚</span> {BRAND_NAME}</h1>
+          <div class="bookly-title">
+            <h1><span class="mark">📚</span> {BRAND_NAME}</h1>
+            <span class="bookly-status">{BRAND_STATUS}</span>
+          </div>
           <p>{BRAND_TAGLINE}</p>
         </div>
         """,
@@ -95,71 +107,82 @@ def render_exchange(role: str, content: str, turn: AssistantTurn | None) -> None
 
 
 def render_trace(turn: AssistantTurn) -> None:
-    """The routing line and the collapsed trace for one assistant turn."""
+    """The metadata line and the collapsed trace for one assistant turn."""
     render_model_line(turn)
 
     if not turn.tool_traces:
         # Nothing ran, and an expander promising a trace that says "no tools" is
-        # a click for no reason. The model line above already said what handled
-        # the turn.
+        # a click for no reason. The metadata line above already said what
+        # handled the turn.
         return
 
     with st.expander(TRACE_LABEL, expanded=False):
         render_model_summary(turn)
-        for trace in turn.tool_traces:
-            render_tool_trace(trace, turn)
+        for position, trace in enumerate(turn.tool_traces, start=1):
+            render_tool_trace(trace, turn, position=position)
 
 
 def render_model_line(turn: AssistantTurn) -> None:
-    """The model badge under a reply: visible, deliberately quiet.
+    """The line under a reply: which model, what the turn was, how much ran.
 
-    A small badge and a grey line, not a headline — the customer's answer is the
-    thing on the page, and the routing decision sits beside it.
+    One caption, three segments — `Haiku · Policy lookup · 2 tools` — with the
+    tier as a small badge. Secondary by construction: the customer's answer is
+    the thing on the page, and the routing decision sits under it. The router's
+    own wording is not here; it is in the trace, where a reviewer looks for it.
     """
     if not turn.model_tier:
         return
 
     colour = TIER_COLOURS.get(turn.model_tier.lower(), "grey")
-    st.markdown(
-        f":{colour}-badge[Model: {tier_label(turn.model_tier)}] "
-        f":grey[{model_line_detail(turn)}]"
-    )
+    st.caption(f":{colour}-badge[{tier_label(turn.model_tier)}] {model_line_detail(turn)}")
 
 
 def model_line_detail(turn: AssistantTurn) -> str:
-    """The grey text beside the model badge: why this tier, and how much ran."""
-    parts = [part for part in (turn.routing_reason,) if part]
-    if turn.tool_traces:
-        count = len(turn.tool_traces)
-        parts.append(f"{count} tool call{'s' if count != 1 else ''}")
+    """The text beside the model badge: what the turn was, and how much it ran."""
+    parts = [activity_label(turn.routing_reason, turn.tool_names)]
+    if count := tool_count_label(len(turn.tool_traces)):
+        parts.append(count)
     return " · ".join(parts)
 
 
 def render_model_summary(turn: AssistantTurn) -> None:
-    """Inside the trace: which model, which id, and the rule that chose it."""
-    st.markdown(f"**Model** · {tier_label(turn.model_tier)}")
-    st.caption(f"{turn.model or '—'} — routed because {turn.routing_reason or '—'}")
+    """Inside the trace: which model, which id, and the rule that chose it.
+
+    The deterministic routing reason is kept verbatim here. The line outside
+    renames it for reading; this is the one the router actually recorded.
+    """
+    st.markdown(f"**Model** · {tier_label(turn.model_tier)} · `{turn.model or '—'}`")
+    st.caption(f"Routing · {turn.routing_reason or '—'}")
 
 
-def render_tool_trace(trace: ToolTrace, turn: AssistantTurn) -> None:
-    """One tool call: what was asked, what came back, and how long it took."""
+def render_tool_trace(trace: ToolTrace, turn: AssistantTurn, *, position: int) -> None:
+    """One tool call: what was asked, what came back, and how long it took.
+
+    Two lines rather than a card. The headline is scannable on its own — where in
+    the turn it ran, what it was, whether it worked, how long it measured — and
+    the detail under it is the same detail as before, set as a caption so a turn
+    with three tool calls still fits on a screen.
+
+    Args:
+        trace: The recorded call.
+        turn: The turn it belongs to, for the policy decision beside a check.
+        position: Its place in the turn's execution order, counting from one.
+    """
     colour = STATUS_COLOURS.get(trace.status, "grey")
-    with st.container(border=True):
-        st.markdown(
-            f"**{trace.tool_name}** · {format_latency(trace.latency_ms)} "
-            f":{colour}-badge[{status_label(trace.status)}]"
-        )
+    st.markdown(
+        f"**{position} · {trace.tool_name}** "
+        f":{colour}-badge[{status_mark(trace.status)} {status_label(trace.status)}] "
+        f":grey[{format_latency(trace.latency_ms)}]"
+    )
+    st.caption(f"{trace.result_summary or '—'} · {format_args(trace.tool_args)}")
 
-        st.caption(f"Arguments · {format_args(trace.tool_args)}")
-        st.caption(f"Result · {trace.result_summary or '—'}")
+    # The technical detail of a failure belongs here, where a reviewer looked
+    # for it, and not in the reply the customer read.
+    if trace.error:
+        st.caption(f"Detail · {trace.error}")
 
-        # The technical detail of a failure belongs here, where a reviewer looked
-        # for it, and not in the reply the customer read.
-        if trace.error:
-            st.caption(f"Detail · {trace.error}")
-
-        if turn.eligibility is not None and trace.tool_name == "check_return_eligibility":
-            render_policy_decision(turn)
+    if turn.eligibility is not None and trace.tool_name == "check_return_eligibility":
+        render_policy_decision(turn)
 
 
 def render_policy_decision(turn: AssistantTurn) -> None:
@@ -175,12 +198,13 @@ def render_policy_decision(turn: AssistantTurn) -> None:
     if decision is None:
         return
 
-    st.markdown(f"**Policy** · {decision.policy_id or '—'}")
-    st.markdown(f"**Decision** · {decision_label(decision.eligible)}")
+    st.markdown(
+        f"**Policy** · {decision.policy_id or '—'} "
+        f"· **Decision** · {decision_label(decision.eligible)}"
+    )
 
-    path = format_rule_path(decision.rule_path)
-    if path:
-        st.markdown("**Rule path**")
+    if path := format_rule_path(decision.rule_path):
+        st.caption("Rule path")
         st.markdown(f'<div class="bookly-path">{path}</div>', unsafe_allow_html=True)
 
 

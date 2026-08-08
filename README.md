@@ -275,26 +275,28 @@ eligibility token. Email addresses are masked to `a***@example.com`.
 
 ## The UI
 
-The conversation is the page. Under each assistant reply there is a badge saying
-which model handled the turn, and one collapsed **Agent trace** describing *that*
-reply:
+The conversation is the page. Under each assistant reply there is one quiet line
+saying which model handled the turn, what the turn was, and how much ran — and one
+collapsed **Agent trace** describing *that* reply:
 
 ```
-Model: Sonnet   return or refund intent · 1 tool call
+[Sonnet]  Return workflow · 1 tool
 
 ▸ Agent trace
-    Model · Sonnet
-    claude-sonnet-5 — routed because return or refund intent
+    Model · Sonnet · claude-sonnet-5
+    Routing · return or refund workflow
 
-    check_return_eligibility · 390 ms  [Success]
-    Arguments · order_id=ORD-1001, item_id=ITEM-100, customer_id=CUST-001
-    Result · eligible=True, policy_id=STANDARD_30_DAY, requires_human=False
-    Policy · STANDARD_30_DAY
-    Decision · Eligible
+    1 · check_return_eligibility  [✓ Success]  390 ms
+    eligible=True, policy_id=STANDARD_30_DAY · order_id=ORD-1001, item_id=ITEM-100
+    Policy · STANDARD_30_DAY · Decision · Eligible
     Rule path
-      PhysicalBook
-      → STANDARD_30_DAY
+      PhysicalBook → STANDARD_30_DAY
 ```
+
+The line outside the trace is written for reading — *Policy lookup*, *Order
+lookup*, *Return workflow*. The router's own deterministic reason is not
+paraphrased away: it is printed verbatim inside the trace, next to the model id
+that served the turn.
 
 Per turn, not one list at the bottom of the page: the point is to connect an
 action to the reply that produced it. Tools appear in execution order, and every

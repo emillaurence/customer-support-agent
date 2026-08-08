@@ -24,6 +24,7 @@ from tests.test_hero_flow import (
     hero_script,  # noqa: F401 - imported so pytest registers the fixture here too
 )
 from ui.format import (
+    activity_label,
     decision_label,
     display_args,
     format_args,
@@ -31,7 +32,9 @@ from ui.format import (
     format_rule_path,
     rule_path_nodes,
     status_label,
+    status_mark,
     tier_label,
+    tool_count_label,
 )
 from ui.turns import AssistantTurn, capture_turn, eligibility_for, pair_turns
 
@@ -143,6 +146,79 @@ def test_decision_reads_as_a_decision() -> None:
     assert decision_label(False) == "Not eligible"
 
 
+def test_every_status_has_a_glyph_and_keeps_its_word() -> None:
+    """The mark is for scanning; the word is what actually says what happened."""
+    assert status_mark(ToolStatus.OK) == "✓"
+    assert {status_mark(status) for status in ToolStatus} == {"✓", "⊘", "✕", "–"}
+
+
+# --- The metadata line ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("informational policy lookup", "Policy lookup"),
+        ("return or refund workflow", "Return workflow"),
+        ("a return workflow is open", "Return workflow"),
+        ("a return is awaiting confirmation", "Return confirmation"),
+        ("escalation intent", "Escalation"),
+        ("request to depart from policy", "Policy exception"),
+        ("ambiguous reference to resolve", "Clarification"),
+        ("multi-turn context (6 turns)", "Extended conversation"),
+    ],
+)
+def test_the_metadata_line_names_the_turn_without_quoting_the_router(
+    reason: str, expected: str
+) -> None:
+    """Short, friendly, and none of the router's own phrasing.
+
+    The line under a reply is skimmed, and "a return is awaiting confirmation" is
+    written to explain a decision rather than to be skimmed. The reason itself is
+    not lost — `render_model_summary` prints it verbatim inside the trace.
+    """
+    assert activity_label(reason) == expected
+
+
+@pytest.mark.parametrize(
+    ("tools", "expected"),
+    [
+        (["lookup_order"], "Order lookup"),
+        (["verify_identity", "lookup_order", "lookup_order"], "Order lookup"),
+        (["search_policy"], "Policy lookup"),
+        (["verify_identity"], "Identity check"),
+        (["lookup_order", "check_return_eligibility"], "Eligibility check"),
+        ([], "Support question"),
+    ],
+)
+def test_a_reason_that_says_nothing_is_labelled_by_what_ran(
+    tools: list[str], expected: str
+) -> None:
+    """"Simple read-only request" describes the routing, not the turn.
+
+    So for the Haiku default the label comes from the tools the turn actually
+    ran, most decisive first — a turn that evaluated eligibility is an
+    eligibility check even though it read an order to get there.
+    """
+    assert activity_label("simple read-only request", tools) == expected
+
+
+def test_an_unrecognised_reason_falls_back_rather_than_leaking() -> None:
+    """A reason added to the router later reads as a turn, not as a raw string."""
+    assert activity_label("some new rule fired", []) == "Support question"
+    assert activity_label("some new rule fired", ["lookup_order"]) == "Order lookup"
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"), [(0, ""), (1, "1 tool"), (2, "2 tools"), (3, "3 tools")]
+)
+def test_the_tool_count_is_compact_and_absent_when_nothing_ran(
+    count: int, expected: str
+) -> None:
+    """"0 tools" is a segment saying nothing, so the line drops it."""
+    assert tool_count_label(count) == expected
+
+
 # --- Sanitization --------------------------------------------------------
 
 
@@ -193,7 +269,7 @@ def test_arguments_render_as_one_line() -> None:
 def test_a_simple_path_reads_from_category_to_policy() -> None:
     """The hero decision: one hop, two nodes, in the order they were walked."""
     assert rule_path_nodes(STANDARD_PATH) == ["PhysicalBook", "STANDARD_30_DAY"]
-    assert format_rule_path(STANDARD_PATH) == "PhysicalBook\n→ STANDARD_30_DAY"
+    assert format_rule_path(STANDARD_PATH) == "PhysicalBook → STANDARD_30_DAY"
 
 
 def test_a_regional_path_shows_what_granted_it_and_what_it_displaced() -> None:
@@ -237,7 +313,7 @@ def test_the_path_comes_off_a_real_decision(seeded_graph, now) -> None:
 
     decision = check_return_eligibility(IN_WINDOW_ORDER, IN_WINDOW_ITEM, HERO_CUSTOMER, now=now)
 
-    assert format_rule_path(decision.rule_path) == "PhysicalBook\n→ STANDARD_30_DAY"
+    assert format_rule_path(decision.rule_path) == "PhysicalBook → STANDARD_30_DAY"
 
 
 # --- Traces belong to the turn that caused them --------------------------
@@ -358,7 +434,7 @@ def test_the_decision_is_shown_against_the_check_that_made_it() -> None:
 
     assert decision is not None
     assert decision.policy_id == "STANDARD_30_DAY"
-    assert format_rule_path(decision.rule_path) == "PhysicalBook\n→ STANDARD_30_DAY"
+    assert format_rule_path(decision.rule_path) == "PhysicalBook → STANDARD_30_DAY"
 
 
 def test_a_turn_without_a_check_gets_no_decision() -> None:
@@ -526,7 +602,7 @@ def test_the_eligibility_turn_shows_the_policy_and_the_path(
     assert eligibility_turn.eligibility.policy_id == "STANDARD_30_DAY"
     assert eligibility_turn.eligibility.eligible is True
     assert format_rule_path(eligibility_turn.eligibility.rule_path) == (
-        "PhysicalBook\n→ STANDARD_30_DAY"
+        "PhysicalBook → STANDARD_30_DAY"
     )
     # The earlier turns explain nothing about policy, and must not claim to.
     assert all(turn.eligibility is None for turn in turns[:-1])
@@ -590,7 +666,7 @@ def test_the_outside_window_turn_shows_a_refusal_with_its_policy(
     assert turn.eligibility is not None
     assert decision_label(turn.eligibility.eligible) == "Not eligible"
     assert turn.eligibility.policy_id == "STANDARD_30_DAY"
-    assert format_rule_path(turn.eligibility.rule_path) == "PhysicalBook\n→ STANDARD_30_DAY"
+    assert format_rule_path(turn.eligibility.rule_path) == "PhysicalBook → STANDARD_30_DAY"
 
 
 def test_a_blocked_write_is_visible_in_the_turn_that_attempted_it(

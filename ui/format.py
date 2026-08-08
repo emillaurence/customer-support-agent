@@ -42,8 +42,60 @@ STATUS_LABELS: dict[ToolStatus, str] = {
 the system working, and an unreachable database is not.
 """
 
+STATUS_MARKS: dict[ToolStatus, str] = {
+    ToolStatus.OK: "✓",
+    ToolStatus.BLOCKED: "⊘",
+    ToolStatus.ERROR: "✕",
+    ToolStatus.REJECTED: "–",
+}
+"""One glyph per outcome, so a trace of three tools can be scanned in a glance.
+
+The word is kept beside it — a glyph alone asks the reader to remember a legend.
+"""
+
 TIER_LABELS: dict[str, str] = {"haiku": "Haiku", "sonnet": "Sonnet"}
 """Tier names as they are written for a reader. Anything else is shown as given."""
+
+ACTIVITY_LABELS: dict[str, str] = {
+    "informational policy lookup": "Policy lookup",
+    "return or refund workflow": "Return workflow",
+    "a return workflow is open": "Return workflow",
+    "a return is awaiting confirmation": "Return confirmation",
+    "a confirmed return is pending": "Return confirmation",
+    "conversation is escalated": "Escalated",
+    "escalation intent": "Escalation",
+    "request to depart from policy": "Policy exception",
+    "ambiguous reference to resolve": "Clarification",
+}
+"""A short name for what a turn was, per routing reason.
+
+The line under a reply is read at a glance, and the router's own sentence — "a
+return is awaiting confirmation" — is written to explain a decision rather than
+to be skimmed. The full reason is still shown inside the trace, where a reviewer
+went looking for it.
+"""
+
+MULTI_TURN_PREFIX = "multi-turn context"
+"""The one reason carrying a number, so it is matched by prefix rather than whole."""
+
+MULTI_TURN_LABEL = "Extended conversation"
+
+ACTIVITY_BY_TOOL: dict[str, str] = {
+    "search_policy": "Policy lookup",
+    "check_return_eligibility": "Eligibility check",
+    "initiate_return": "Return workflow",
+    "escalate_to_human": "Escalation",
+    "lookup_order": "Order lookup",
+    "verify_identity": "Identity check",
+}
+"""What a turn was, when the routing reason does not say — first match wins.
+
+Ordered most decisive first: a turn that evaluated eligibility is an eligibility
+check even though it read an order to get there.
+"""
+
+CONVERSATION_LABEL = "Support question"
+"""A turn that ran nothing and was routed on nothing in particular."""
 
 
 def format_latency(latency_ms: float) -> str:
@@ -71,9 +123,53 @@ def status_label(status: ToolStatus | str) -> str:
     return STATUS_LABELS.get(ToolStatus(status), str(status).title())
 
 
+def status_mark(status: ToolStatus | str) -> str:
+    """The glyph for a tool outcome, shown beside the word."""
+    return STATUS_MARKS.get(ToolStatus(status), "·")
+
+
 def tier_label(model_tier: str) -> str:
     """`'haiku'` → `'Haiku'`. An unrecognised tier is shown as it was recorded."""
     return TIER_LABELS.get(model_tier.lower(), model_tier or "—")
+
+
+def activity_label(routing_reason: str, tool_names: list[str] | None = None) -> str:
+    """A short name for what a turn did, for the line under the reply.
+
+    Presentation only: it renames the router's reason, it does not second-guess
+    it. The reason is looked up first, because that is the decision the system
+    actually made; the tools are consulted only for the reasons that say nothing
+    about subject matter — the Haiku default, and anything unrecognised.
+
+    Args:
+        routing_reason: `ModelDecision.reason`, as recorded on the turn.
+        tool_names: The tools the turn ran, in execution order.
+
+    Returns:
+        For example `"Policy lookup"`, `"Return workflow"`, `"Order lookup"`.
+    """
+    reason = routing_reason.strip()
+    if label := ACTIVITY_LABELS.get(reason.lower()):
+        return label
+    if reason.lower().startswith(MULTI_TURN_PREFIX):
+        return MULTI_TURN_LABEL
+
+    ran = tool_names or []
+    for tool, label in ACTIVITY_BY_TOOL.items():
+        if tool in ran:
+            return label
+    return CONVERSATION_LABEL
+
+
+def tool_count_label(count: int) -> str:
+    """`"2 tools"`, `"1 tool"`, or `""` when a turn ran none.
+
+    An empty string rather than "0 tools": a turn that ran nothing has nothing to
+    report, and the metadata line drops the segment entirely.
+    """
+    if count <= 0:
+        return ""
+    return f"{count} tool{'s' if count != 1 else ''}"
 
 
 def display_args(tool_args: dict[str, Any]) -> dict[str, Any]:
@@ -132,25 +228,24 @@ def rule_path_nodes(rule_path: list[str]) -> list[str]:
 
 
 def format_rule_path(rule_path: list[str]) -> str:
-    """The rule path as the trace prints it: one node per line, arrows between.
+    """The rule path as the trace prints it: one chain, arrows between the hops.
 
     For example::
 
-        PhysicalBook
-        → STANDARD_30_DAY
+        PhysicalBook → STANDARD_30_DAY
+
+    Written on one line so the traversal reads as a chain rather than a list, and
+    so a narrow window wraps it instead of scrolling it.
 
     Args:
         rule_path: `EligibilityDecision.rule_path`.
 
     Returns:
-        The lines joined by newlines, or `""` when there is no path — a refusal
+        The nodes joined by arrows, or `""` when there is no path — a refusal
         that never reached a policy has none, and inventing one would suggest a
         traversal that never happened.
     """
-    nodes = rule_path_nodes(rule_path)
-    if not nodes:
-        return ""
-    return "\n".join([nodes[0], *(f"→ {node}" for node in nodes[1:])])
+    return " → ".join(rule_path_nodes(rule_path))
 
 
 def decision_label(eligible: bool) -> str:

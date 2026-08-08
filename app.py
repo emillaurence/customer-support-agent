@@ -40,16 +40,13 @@ from ui.turns import AssistantTurn, capture_turn, pair_turns
 
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="centered")
 
-UNAVAILABLE = (
-    "Sorry, I'm having trouble accessing support right now. Please try again in a moment."
-)
-"""What the customer sees if the shell itself fails.
-
-The agent already answers an Anthropic outage, an unreachable policy graph, and a
-failed tool with a sentence of its own — see `agent.orchestrator` and
-`agent.tool_registry`. This covers only the case where the call around it did not
-come back at all, so that a customer never meets a stack trace.
-"""
+# What the customer sees if the shell itself fails. One sentence, and nothing
+# about why: the agent already answers an outage, an unreachable policy graph,
+# and a failed tool with a sentence of its own, so this covers only the case
+# where the call around it did not come back at all. Written as a comment rather
+# than a docstring on purpose — Streamlit's magic renders a bare string at the
+# top level of the script, and implementation notes are not customer copy.
+UNAVAILABLE = "Something went wrong. Please try again, or reset the conversation."
 
 
 def get_session() -> SessionState:
