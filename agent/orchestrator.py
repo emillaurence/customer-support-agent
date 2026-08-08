@@ -137,6 +137,11 @@ class BooklyAgent:
         state.transcript.append({"role": "user", "content": user_message})
 
         decision = select_model(state, user_message)
+        if decision.return_intent:
+            # The router found return intent in this message. Remember it, so the
+            # turns spent working out which book they mean stay on Sonnet — the
+            # eligibility check usually happens on one of them.
+            state.return_intent_expressed = True
         model_id = self._model_id(decision)
         turn = ModelTurn(
             session_id=state.session_id,
@@ -177,6 +182,14 @@ class BooklyAgent:
                     system=self.system_prompt,
                     tools=TOOL_SCHEMAS,
                     messages=state.transcript,
+                    # One temperature, both tiers — the loop has a single exit to
+                    # Anthropic, so there is nowhere for a turn to be sampled
+                    # differently. Omitted entirely unless a deployment set one:
+                    # this agent wants consistent, repeatable behaviour, and
+                    # current models get there by managing their own sampling.
+                    # Either way it only reaches tone — business truth and every
+                    # state-changing action stay with the deterministic tools.
+                    **self._sampling(),
                 )
             except Exception as exc:  # noqa: BLE001 - any API failure ends the turn safely
                 # Rate limit, outage, bad key, dropped connection. The customer
@@ -205,10 +218,19 @@ class BooklyAgent:
             # results go back in one user message — that is what the Messages
             # API expects, and splitting them teaches the model not to ask for
             # more than one at a time.
+            # Several orders looked up together is the agent building a "which
+            # of these did you mean?" question, so none of them becomes the
+            # active order — see `_browsing_orders`.
+            adopt_active_order = not _browsing_orders(tool_uses)
+
             results = []
             for block in tool_uses:
                 turn.tool_calls += 1
-                results.append(self._run_one_tool(state, decision, model_id, block))
+                results.append(
+                    self._run_one_tool(
+                        state, decision, model_id, block, adopt_active_order=adopt_active_order
+                    )
+                )
             state.transcript.append({"role": "user", "content": results})
 
         # Out of iterations. Something is looping; say so rather than trying
@@ -217,7 +239,13 @@ class BooklyAgent:
         return FALLBACK_STUCK
 
     def _run_one_tool(
-        self, state: SessionState, decision: ModelDecision, model_id: str, block: Any
+        self,
+        state: SessionState,
+        decision: ModelDecision,
+        model_id: str,
+        block: Any,
+        *,
+        adopt_active_order: bool = True,
     ) -> dict[str, Any]:
         """Run one requested tool, trace it, and update state from what it returned.
 
@@ -226,6 +254,8 @@ class BooklyAgent:
             decision: This turn's routing decision, recorded on the trace.
             model_id: The model that asked for the call.
             block: The `tool_use` block from the response.
+            adopt_active_order: Passed through to `apply_to_state`. False when
+                this turn is reading out several orders rather than opening one.
 
         Returns:
             The `tool_result` block to send back to Anthropic.
@@ -238,7 +268,7 @@ class BooklyAgent:
         # State is updated only from a tool that actually succeeded. A blocked
         # guard or a failed call leaves the session exactly as it was.
         if outcome.status is ToolStatus.OK:
-            apply_to_state(name, args, outcome, state)
+            apply_to_state(name, args, outcome, state, adopt_active_order=adopt_active_order)
 
         state.tool_traces.append(
             ToolTrace(
@@ -294,6 +324,21 @@ class BooklyAgent:
         if pending.asked and confirmation.is_affirmative(user_message):
             state.confirmed = True
 
+    def _sampling(self) -> dict[str, Any]:
+        """The sampling arguments for a request — usually none at all.
+
+        A configured temperature is passed through; an unconfigured one is not
+        expressed. The distinction matters: a model that manages its own
+        sampling rejects the parameter outright, and sending a default would
+        fail every turn rather than quietly doing nothing.
+
+        Returns:
+            `{"temperature": value}` when a deployment set one, else `{}`.
+        """
+        if self.config.temperature is None:
+            return {}
+        return {"temperature": self.config.temperature}
+
     def _model_id(self, decision: ModelDecision) -> str:
         """Resolve a tier to the model id the environment configured for it."""
         return (
@@ -339,6 +384,28 @@ class BooklyAgent:
 def _block_type(block: Any) -> str:
     """The `type` of a content block."""
     return getattr(block, "type", "")
+
+
+def _browsing_orders(tool_uses: list[Any]) -> bool:
+    """Whether this response is reading out several orders rather than opening one.
+
+    A customer with two live orders gets asked which one they mean, and to ask
+    that well the agent has to say something about each — so it looks both up in
+    the same turn. Adopting the last one read as "the order under discussion"
+    would answer the question the agent is in the middle of asking.
+
+    Args:
+        tool_uses: The `tool_use` blocks in one assistant response.
+
+    Returns:
+        True when two or more *different* orders were looked up together.
+    """
+    order_ids = {
+        (getattr(block, "input", None) or {}).get("order_id")
+        for block in tool_uses
+        if getattr(block, "name", "") == "lookup_order"
+    }
+    return len(order_ids - {None}) > 1
 
 
 def _assistant_text_message(text: str) -> dict[str, Any]:

@@ -185,10 +185,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "item_id": {"type": "string", "description": "The item being returned."},
                 "reason": {
                     "type": "string",
-                    "description": "The customer's stated reason, in their own words. Do not paraphrase.",
+                    "description": (
+                        "The customer's stated reason, in their own words, if they have given "
+                        "one. Do not paraphrase, and do not hold the return up to ask for one — "
+                        "omit it if they have not said why."
+                    ),
                 },
             },
-            "required": ["order_id", "item_id", "reason"],
+            "required": ["order_id", "item_id"],
         },
     },
     {
@@ -431,7 +435,11 @@ def _initiate_return(args: dict, state: SessionState, now: datetime | None) -> T
         "order_id": args["order_id"],
         "item_id": args["item_id"],
         "customer_id": state.verified_customer_id,
-        "reason": args["reason"],
+        # The reason is not a gate, so it must not be able to stop a confirmed
+        # return. If the model did not supply one, fall back to what the session
+        # already recorded from the eligibility check — a customer who said why
+        # once should not be asked again — and to nothing if they never said.
+        "reason": args.get("reason") or state.return_reason or "",
         "eligibility_token": state.eligibility_token or "",
         "confirmed": state.confirmed,
     }
@@ -472,7 +480,12 @@ def _ok(result: BaseModel, used: dict[str, Any]) -> ToolOutcome:
 
 
 def apply_to_state(
-    name: str, args: dict[str, Any], outcome: ToolOutcome, state: SessionState
+    name: str,
+    args: dict[str, Any],
+    outcome: ToolOutcome,
+    state: SessionState,
+    *,
+    adopt_active_order: bool = True,
 ) -> None:
     """Update session state from a tool result — and only from a tool result.
 
@@ -493,6 +506,11 @@ def apply_to_state(
             reason. Never for a value a tool result can supply.
         outcome: What it returned.
         state: The session to update, in place.
+        adopt_active_order: Whether a successful `lookup_order` may make its
+            order the one under discussion. False when the same turn looked up
+            several orders — reading two out to a customer who has not chosen is
+            browsing, not selecting, and the last one read is not an answer. See
+            `agent.orchestrator._browsing_orders`.
     """
     if outcome.status is not ToolStatus.OK or outcome.payload is None:
         return
@@ -510,7 +528,12 @@ def apply_to_state(
             state.active_order_id = payload.active_order_ids[0]
 
     elif name == "lookup_order":
-        state.active_order_id = payload.order.order_id
+        # Looking an order up is normally how it becomes the one being discussed
+        # — the customer named it, or they only have one. Not when the agent is
+        # reading out a list for them to choose from; then the choice is still
+        # theirs to make, and the next turn's lookup is what records it.
+        if adopt_active_order:
+            state.active_order_id = payload.order.order_id
 
     elif name == "check_return_eligibility":
         order_id = outcome.args_used["order_id"]

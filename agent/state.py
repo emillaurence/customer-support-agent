@@ -91,6 +91,13 @@ class SessionState(BaseModel):
         default=None,
         description="The customer's stated reason, in their own words. Not paraphrased.",
     )
+    return_intent_expressed: bool = Field(
+        default=False,
+        description=(
+            "True once the customer has asked about a return, even before an item is "
+            "chosen. Keeps the turns spent working out which book they mean on Sonnet."
+        ),
+    )
     eligibility: EligibilityDecision | None = Field(
         default=None,
         description="The last decision from check_return_eligibility, kept so it can be quoted.",
@@ -137,12 +144,16 @@ class SessionState(BaseModel):
     def return_workflow_active(self) -> bool:
         """Whether a return is being worked on right now.
 
-        True from the moment an item is under discussion, not just once a token
-        exists — the reasoning that picks the item is part of the workflow, and
-        the router should already be on Sonnet by then.
+        True from the moment the customer says they want to return something, not
+        just once a token exists. Picking which book they mean is part of the
+        workflow, and "Designing Data-Intensive Applications" is not a sentence
+        with a return keyword in it — so without this the turn that chooses the
+        item, and therefore the turn that runs the eligibility check, would drop
+        back to the cheaper model in the middle of a return.
         """
         return any(
             (
+                self.return_intent_expressed,
                 self.active_item_id is not None,
                 self.return_reason is not None,
                 self.eligibility is not None,
@@ -188,6 +199,7 @@ class SessionState(BaseModel):
         self.active_order_id = None
         self.active_item_id = None
         self.return_reason = None
+        self.return_intent_expressed = False
         self.eligibility = None
         self.eligibility_token = None
         self.pending_return = None
