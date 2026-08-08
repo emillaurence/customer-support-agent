@@ -1,0 +1,92 @@
+[
+  {
+    "order_id": "ORD-1001",
+    "customer_id": "CUST-001",
+    "status": "delivered",
+    "placed_at": "2026-07-24",
+    "delivered_at": "2026-07-28",
+    "items": [
+      { "item_id": "ITEM-100", "quantity": 1, "unit_price": 42.0 }
+    ],
+    "scenario": "Physical book inside the standard 30-day window (delivered 11 days before 2026-08-08)."
+  },
+  {
+    "order_id": "ORD-1002",
+    "customer_id": "CUST-001",
+    "status": "delivered",
+    "placed_at": "2026-05-29",
+    "delivered_at": "2026-06-02",
+    "items": [
+      { "item_id": "ITEM-101", "quantity": 1, "unit_price": 55.0 }
+    ],
+    "scenario": "Physical book outside every window (67 days). No promotion, no regional override."
+  },
+  {
+    "order_id": "ORD-1003",
+    "customer_id": "CUST-002",
+    "status": "delivered",
+    "placed_at": "2026-07-01",
+    "delivered_at": "2026-07-05",
+    "items": [
+      { "item_id": "ITEM-102", "quantity": 1, "unit_price": 24.0 },
+      { "item_id": "ITEM-201", "quantity": 1, "unit_price": 24.0 }
+    ],
+    "scenario": "AU customer at day 34: past STANDARD_30_DAY, inside AU_BOOKLY_EXTENDED_RETURN. The ebook on the same order stays non-returnable."
+  },
+  {
+    "order_id": "ORD-1004",
+    "customer_id": "CUST-003",
+    "status": "delivered",
+    "placed_at": "2026-08-01",
+    "delivered_at": "2026-08-01",
+    "items": [
+      { "item_id": "ITEM-200", "quantity": 1, "unit_price": 19.0 }
+    ],
+    "scenario": "Ebook delivered 7 days ago — well inside any window, still refused by DIGITAL_NO_RETURN."
+  },
+  {
+    "order_id": "ORD-1005",
+    "customer_id": "CUST-003",
+    "status": "in_transit",
+    "placed_at": "2026-08-05",
+    "delivered_at": null,
+    "items": [
+      { "item_id": "ITEM-101", "quantity": 1, "unit_price": 55.0 }
+    ],
+    "scenario": "Order in transit. No delivery date, so no return window has started. Second active order for CUST-003."
+  },
+  {
+    "order_id": "ORD-1006",
+    "customer_id": "CUST-004",
+    "status": "delivered",
+    "placed_at": "2026-06-24",
+    "delivered_at": "2026-06-28",
+    "items": [
+      { "item_id": "ITEM-103", "quantity": 1, "unit_price": 31.0 }
+    ],
+    "promotion_code": "MIDYEAR_HOLIDAY_SALE_2026",
+    "scenario": "Promotional extended return: day 41, past STANDARD_30_DAY but inside the 60-day HOLIDAY_EXTENDED_RETURN granted by the sale the order was placed under."
+  },
+  {
+    "order_id": "ORD-1007",
+    "customer_id": "CUST-002",
+    "status": "delivered",
+    "placed_at": "2026-07-16",
+    "delivered_at": "2026-07-20",
+    "items": [
+      { "item_id": "ITEM-100", "quantity": 1, "unit_price": 42.0 }
+    ],
+    "scenario": "Inside the window, but RET-5001 is already open against this item — a second return must be refused, not created."
+  },
+  {
+    "order_id": "ORD-1008",
+    "customer_id": "CUST-004",
+    "status": "delivered",
+    "placed_at": "2026-07-11",
+    "delivered_at": "2026-07-15",
+    "items": [
+      { "item_id": "ITEM-101", "quantity": 1, "unit_price": 55.0 }
+    ],
+    "scenario": "Belongs to CUST-004. Used to check that another customer (e.g. CUST-001) quoting this order number gets nothing back."
+  }
+]

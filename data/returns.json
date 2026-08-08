@@ -1,0 +1,12 @@
+[
+  {
+    "return_id": "RET-5001",
+    "order_id": "ORD-1007",
+    "item_id": "ITEM-100",
+    "customer_id": "CUST-002",
+    "status": "requested",
+    "reason": "Cover arrived creased.",
+    "created_at": "2026-07-25T09:14:00Z",
+    "scenario": "The one pre-existing RMA. Blocks a duplicate return on ORD-1007 / ITEM-100."
+  }
+]

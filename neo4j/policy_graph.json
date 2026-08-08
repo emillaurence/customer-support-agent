@@ -1,0 +1,141 @@
+{
+  "description": "Fixture mirror of the Bookly policy graph. Read directly while there is no Neo4j connection. Kept byte-for-byte consistent with seed.cypher: same nodes, same relationships, same property values.",
+  "as_of": "2026-08-08",
+  "node_key": "Each node has a `key` used as the endpoint name in `relationships`. Keys are not stored in Neo4j; the MERGE identity property is noted per node type in seed.cypher.",
+
+  "nodes": [
+    {
+      "key": "PhysicalBook",
+      "labels": ["ProductType"],
+      "properties": { "name": "PhysicalBook", "returnable": true }
+    },
+    {
+      "key": "EBook",
+      "labels": ["ProductType"],
+      "properties": { "name": "EBook", "returnable": false }
+    },
+
+    {
+      "key": "AU",
+      "labels": ["Region"],
+      "properties": { "code": "AU", "name": "Australia" }
+    },
+    {
+      "key": "GB",
+      "labels": ["Region"],
+      "properties": { "code": "GB", "name": "United Kingdom" }
+    },
+    {
+      "key": "US",
+      "labels": ["Region"],
+      "properties": { "code": "US", "name": "United States" }
+    },
+
+    {
+      "key": "STANDARD_30_DAY",
+      "labels": ["Policy"],
+      "properties": {
+        "policy_id": "STANDARD_30_DAY",
+        "name": "Standard 30-day returns",
+        "precedence": 0,
+        "summary": "Physical books may be returned within 30 days of delivery, in resalable condition."
+      }
+    },
+    {
+      "key": "DIGITAL_NO_RETURN",
+      "labels": ["Policy"],
+      "properties": {
+        "policy_id": "DIGITAL_NO_RETURN",
+        "name": "Digital purchases are final",
+        "precedence": 100,
+        "summary": "Ebooks cannot be returned once the download has been made available."
+      }
+    },
+    {
+      "key": "HOLIDAY_EXTENDED_RETURN",
+      "labels": ["Policy", "PromotionalPolicy"],
+      "properties": {
+        "policy_id": "HOLIDAY_EXTENDED_RETURN",
+        "name": "Holiday sale extended returns",
+        "precedence": 5,
+        "summary": "Physical books bought during a Bookly holiday sale may be returned within 60 days of delivery instead of 30."
+      }
+    },
+    {
+      "key": "AU_BOOKLY_EXTENDED_RETURN",
+      "labels": ["Policy", "RegionalPolicy"],
+      "properties": {
+        "policy_id": "AU_BOOKLY_EXTENDED_RETURN",
+        "name": "Bookly Australia extended returns",
+        "precedence": 10,
+        "summary": "A Bookly goodwill extension: customers in Australia get 45 days on physical books instead of 30. This is Bookly's own policy, not a statement about Australian law."
+      }
+    },
+
+    {
+      "key": "WINDOW_30_DAY",
+      "labels": ["ReturnWindow"],
+      "properties": { "window_id": "WINDOW_30_DAY", "days": 30, "starts_from": "delivered_at" }
+    },
+    {
+      "key": "WINDOW_45_DAY",
+      "labels": ["ReturnWindow"],
+      "properties": { "window_id": "WINDOW_45_DAY", "days": 45, "starts_from": "delivered_at" }
+    },
+    {
+      "key": "WINDOW_60_DAY",
+      "labels": ["ReturnWindow"],
+      "properties": { "window_id": "WINDOW_60_DAY", "days": 60, "starts_from": "delivered_at" }
+    },
+
+    {
+      "key": "MIDYEAR_HOLIDAY_SALE_2026",
+      "labels": ["Promotion"],
+      "properties": {
+        "code": "MIDYEAR_HOLIDAY_SALE_2026",
+        "name": "Mid-year holiday sale 2026",
+        "active_from": "2026-06-15",
+        "active_to": "2026-07-15"
+      }
+    },
+
+    {
+      "key": "DAMAGED_ON_ARRIVAL",
+      "labels": ["Exception"],
+      "properties": {
+        "code": "DAMAGED_ON_ARRIVAL",
+        "name": "Damaged or faulty on arrival",
+        "summary": "A book that arrived damaged or faulty is returnable even if the window has closed. Needs human review before approval."
+      }
+    }
+  ],
+
+  "relationships": [
+    { "type": "GOVERNED_BY", "from": "PhysicalBook", "to": "STANDARD_30_DAY" },
+    { "type": "GOVERNED_BY", "from": "EBook", "to": "DIGITAL_NO_RETURN" },
+    { "type": "GOVERNED_BY", "from": "PhysicalBook", "to": "HOLIDAY_EXTENDED_RETURN" },
+    { "type": "GOVERNED_BY", "from": "PhysicalBook", "to": "AU_BOOKLY_EXTENDED_RETURN" },
+
+    { "type": "HAS_WINDOW", "from": "STANDARD_30_DAY", "to": "WINDOW_30_DAY" },
+    { "type": "HAS_WINDOW", "from": "AU_BOOKLY_EXTENDED_RETURN", "to": "WINDOW_45_DAY" },
+    { "type": "HAS_WINDOW", "from": "HOLIDAY_EXTENDED_RETURN", "to": "WINDOW_60_DAY" },
+
+    { "type": "HAS_OVERRIDE", "from": "AU", "to": "AU_BOOKLY_EXTENDED_RETURN" },
+
+    { "type": "GRANTS", "from": "MIDYEAR_HOLIDAY_SALE_2026", "to": "HOLIDAY_EXTENDED_RETURN" },
+
+    { "type": "OVERRIDES", "from": "HOLIDAY_EXTENDED_RETURN", "to": "STANDARD_30_DAY" },
+    { "type": "OVERRIDES", "from": "AU_BOOKLY_EXTENDED_RETURN", "to": "STANDARD_30_DAY" },
+    { "type": "OVERRIDES", "from": "AU_BOOKLY_EXTENDED_RETURN", "to": "HOLIDAY_EXTENDED_RETURN" },
+
+    { "type": "WAIVES", "from": "DAMAGED_ON_ARRIVAL", "to": "STANDARD_30_DAY" },
+    { "type": "WAIVES", "from": "DAMAGED_ON_ARRIVAL", "to": "AU_BOOKLY_EXTENDED_RETURN" },
+    { "type": "WAIVES", "from": "DAMAGED_ON_ARRIVAL", "to": "HOLIDAY_EXTENDED_RETURN" }
+  ],
+
+  "notes": [
+    "DIGITAL_NO_RETURN has no HAS_WINDOW edge and no OVERRIDES edge pointing at it. The absence is the rule: nothing extends a window that does not exist, so no regional or promotional policy can rescue an ebook.",
+    "DAMAGED_ON_ARRIVAL does not WAIVE DIGITAL_NO_RETURN either. A faulty ebook is an escalation, not a return.",
+    "Precedence is stored twice on purpose: as the `precedence` property (cheap sort) and as OVERRIDES edges (explainable path). The edges are the source of truth for the explanation shown to a customer."
+  ]
+}
