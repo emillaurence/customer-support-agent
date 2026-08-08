@@ -1,11 +1,13 @@
-"""Fixture integrity: the mock data and the policy graph must agree.
+"""Fixture integrity: the mock data and the policy graph seed must agree.
 
 These tests DO run. They assert nothing about product behaviour — only that
 every JSON file parses, validates against the models, and cross-references
 something that exists. Broken fixtures would otherwise show up much later as
 confusing agent behaviour.
 
-Nothing here touches Neo4j.
+`data/` is mock transactional data only. Policy lives in Neo4j;
+`neo4j/policy_graph.json` is the seed ingestion reads, and it is checked here as
+seed data, not as a runtime policy source. Nothing here connects to Neo4j.
 """
 
 from __future__ import annotations
@@ -42,11 +44,6 @@ def orders() -> list[Order]:
 
 
 @pytest.fixture(scope="module")
-def policies() -> list[Policy]:
-    return [Policy.model_validate(p) for p in _load(DATA / "policies.json")]
-
-
-@pytest.fixture(scope="module")
 def returns() -> list[ReturnRecord]:
     return [ReturnRecord.model_validate(r) for r in _load(DATA / "returns.json")]
 
@@ -56,19 +53,26 @@ def graph() -> dict:
     return _load(GRAPH)
 
 
+@pytest.fixture(scope="module")
+def policies(graph: dict) -> list[Policy]:
+    """Policies come from the graph seed — there is no policy JSON in data/."""
+    return [Policy.model_validate(p) for p in graph["policies"]]
+
+
 # --- Every file parses and validates ------------------------------------
 
 
 @pytest.mark.parametrize(
     "filename",
-    ["customers.json", "items.json", "orders.json", "policies.json", "returns.json"],
+    ["customers.json", "items.json", "orders.json", "returns.json"],
 )
 def test_data_file_parses(filename: str) -> None:
     assert isinstance(_load(DATA / filename), list)
 
 
-def test_policy_graph_parses(graph: dict) -> None:
-    assert graph["nodes"] and graph["relationships"]
+def test_policy_graph_has_every_section(graph: dict) -> None:
+    for section in ("categories", "policies", "regions", "relationships"):
+        assert graph[section], section
 
 
 # --- Ids are unique -----------------------------------------------------
@@ -126,51 +130,47 @@ def test_delivered_orders_have_a_delivery_date(orders: list[Order]) -> None:
             assert order.delivered_at is None, order.order_id
 
 
-# --- policies.json and the graph agree ----------------------------------
+# --- The policy graph seed is well formed -------------------------------
 
 
-def _graph_nodes(graph: dict, label: str) -> dict[str, dict]:
-    return {n["key"]: n for n in graph["nodes"] if label in n["labels"]}
+def test_data_dir_holds_no_policy_json() -> None:
+    """Policy is Neo4j's job. A policy file in data/ would invite a fallback."""
+    assert sorted(p.name for p in DATA.glob("*.json")) == [
+        "customers.json",
+        "items.json",
+        "orders.json",
+        "returns.json",
+    ]
 
 
-def test_policy_ids_match_the_graph(policies: list[Policy], graph: dict) -> None:
-    assert {p.policy_id for p in policies} == set(_graph_nodes(graph, "Policy"))
-
-
-def test_policy_properties_match_the_graph(policies: list[Policy], graph: dict) -> None:
-    nodes = _graph_nodes(graph, "Policy")
-    for policy in policies:
-        props = nodes[policy.policy_id]["properties"]
-        assert policy.name == props["name"]
-        assert policy.summary == props["summary"]
-        assert policy.precedence == props["precedence"]
-
-
-def test_policy_windows_match_the_graph(policies: list[Policy], graph: dict) -> None:
-    """window_days in JSON must equal the ReturnWindow the graph points at."""
-    windows = {k: n["properties"]["days"] for k, n in _graph_nodes(graph, "ReturnWindow").items()}
-    has_window = {
-        r["from"]: r["to"] for r in graph["relationships"] if r["type"] == "HAS_WINDOW"
+def test_every_policy_node_validates(policies: list[Policy]) -> None:
+    """The seed's Policy nodes match the model the tools will read them back as."""
+    assert {p.policy_id for p in policies} == {
+        "STANDARD_30_DAY",
+        "DIGITAL_NO_RETURN",
+        "HOLIDAY_EXTENDED_RETURN",
+        "AU_BOOKLY_EXTENDED_RETURN",
     }
     for policy in policies:
-        target = has_window.get(policy.policy_id)
-        expected = windows[target] if target else None
-        assert policy.window_days == expected, policy.policy_id
+        assert policy.name and policy.summary
+        # A window without a start date, or a start date without a window,
+        # would be undecidable at eligibility time.
+        assert (policy.window_days is None) == (policy.window_starts_from is None)
+
+
+def test_promotional_policy_has_an_active_window(policies: list[Policy]) -> None:
+    for policy in policies:
+        if policy.promotion_code:
+            assert policy.promotion_active_from and policy.promotion_active_to
+            assert policy.promotion_active_from <= policy.promotion_active_to
 
 
 def test_digital_policy_has_no_window_and_no_overrides(graph: dict) -> None:
-    """The absence of these edges is the rule that ebooks cannot be rescued."""
-    rels = graph["relationships"]
-    assert not [r for r in rels if r["type"] == "HAS_WINDOW" and r["from"] == "DIGITAL_NO_RETURN"]
-    assert not [r for r in rels if r["type"] == "OVERRIDES" and r["to"] == "DIGITAL_NO_RETURN"]
-    assert not [r for r in rels if r["type"] == "WAIVES" and r["to"] == "DIGITAL_NO_RETURN"]
-
-
-def test_graph_relationship_endpoints_exist(graph: dict) -> None:
-    keys = {n["key"] for n in graph["nodes"]}
-    for rel in graph["relationships"]:
-        assert rel["from"] in keys, rel
-        assert rel["to"] in keys, rel
+    """The absence of these is the rule that ebooks cannot be rescued."""
+    digital = next(p for p in graph["policies"] if p["policy_id"] == "DIGITAL_NO_RETURN")
+    assert digital["window_days"] is None
+    assert digital["exceptions"] == []
+    assert not [r for r in graph["relationships"] if r["to"] == "DIGITAL_NO_RETURN" and r["type"] != "GOVERNED_BY"]
 
 
 def test_expected_policy_relationships_are_present(graph: dict) -> None:
@@ -182,43 +182,48 @@ def test_expected_policy_relationships_are_present(graph: dict) -> None:
     assert ("HAS_OVERRIDE", "AU", "AU_BOOKLY_EXTENDED_RETURN") in rels
 
 
-def test_product_types_match_the_enum(items: list[Item], graph: dict) -> None:
-    graph_types = {n["properties"]["name"] for n in _graph_nodes(graph, "ProductType").values()}
-    assert graph_types == {t.value for t in ProductType}
-    assert {i.product_type.value for i in items} <= graph_types
-
-
-# --- Regions and promotions ---------------------------------------------
+def test_categories_match_the_product_type_enum(items: list[Item], graph: dict) -> None:
+    names = {c["name"] for c in graph["categories"]}
+    assert names == {t.value for t in ProductType}
+    assert {i.product_type.value for i in items} <= names
 
 
 def test_customer_countries_exist_as_regions(customers: list[Customer], graph: dict) -> None:
-    codes = {n["properties"]["code"] for n in _graph_nodes(graph, "Region").values()}
+    codes = {r["code"] for r in graph["regions"]}
     for customer in customers:
         assert customer.country in codes, customer.customer_id
 
 
 def test_order_promotions_exist_in_the_graph(orders: list[Order], graph: dict) -> None:
-    codes = {n["properties"]["code"] for n in _graph_nodes(graph, "Promotion").values()}
+    codes = {p["promotion_code"] for p in graph["policies"] if p.get("promotion_code")}
     for order in orders:
         if order.promotion_code:
             assert order.promotion_code in codes, order.order_id
 
 
-def test_promotional_order_was_delivered_inside_the_promotion(orders: list[Order], graph: dict) -> None:
+def test_promotional_order_was_placed_inside_the_promotion(orders: list[Order], graph: dict) -> None:
     """A promotional extension is only coherent if the dates line up."""
     promos = {
-        n["properties"]["code"]: n["properties"]
-        for n in _graph_nodes(graph, "Promotion").values()
+        p["promotion_code"]: p for p in graph["policies"] if p.get("promotion_code")
     }
     for order in orders:
         if not order.promotion_code:
             continue
         promo = promos[order.promotion_code]
-        assert promo["active_from"] <= order.placed_at.isoformat() <= promo["active_to"], order.order_id
+        placed = order.placed_at.isoformat()
+        assert promo["promotion_active_from"] <= placed <= promo["promotion_active_to"], order.order_id
 
 
 def test_seed_cypher_mentions_every_policy(policies: list[Policy]) -> None:
-    """Cheap consistency check between the fixture and the Cypher seed."""
+    """Cheap consistency check between the fixture and the reference Cypher."""
     cypher = (ROOT / "neo4j" / "seed.cypher").read_text()
     for policy in policies:
         assert policy.policy_id in cypher, policy.policy_id
+
+
+def test_seed_cypher_mentions_every_category_and_region(graph: dict) -> None:
+    cypher = (ROOT / "neo4j" / "seed.cypher").read_text()
+    for category in graph["categories"]:
+        assert category["name"] in cypher
+    for region in graph["regions"]:
+        assert f"'{region['code']}'" in cypher

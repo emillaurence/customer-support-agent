@@ -4,8 +4,12 @@ Conversational AI customer support agent with multi-turn workflows, tool use, an
 
 This repo is the **Bookly** support agent — an online bookstore selling physical books and ebooks.
 
-Current state: **architecture and scenarios locked, fixtures and policy model in place.**
-No Anthropic calls, no Neo4j connection, no business logic. Every tool is a documented stub.
+Current state: **architecture and scenarios locked, fixtures and policy model in
+place, Neo4j ingestion working.** No Anthropic calls, no eligibility queries, no
+business logic. Every tool is a documented stub.
+
+**Neo4j is a required dependency for policy and return eligibility evaluation.
+JSON is used only for mock transactional data.**
 
 ## Architecture
 
@@ -13,14 +17,20 @@ No Anthropic calls, no Neo4j connection, no business logic. Every tool is a docu
 Streamlit UI
   └── single Bookly agent (orchestrator + system prompt)
         └── tools
-              ├── JSON fixtures  → customers, orders, items, returns
-              └── Neo4j          → policy rules and eligibility relationships
+              ├── JSON (mock data)  → customers, orders, items, returns
+              └── Neo4j (required)  → policy rules and eligibility relationships
 ```
 
 One agent, a flat set of tools, no service layer and no framework. Customer and
 order data live in flat JSON because it is simple record lookup. Policy lives in a
 graph because eligibility is about *relationships* — which policy governs which
 item category, in which region, during which promotion, and which override wins.
+
+Policy lookup, eligibility rules, policy overrides, regional overrides, and
+explainable rule paths are all decided by Cypher against Neo4j. There is no
+JSON policy engine and no bypass switch: if the graph is unreachable,
+[agent/graph.py](agent/graph.py) raises `PolicyGraphUnavailableError` and the
+tool fails. It never degrades to a fixture or returns a mocked decision.
 
 ## Layout
 
@@ -32,8 +42,9 @@ item category, in which region, during which promotion, and which override wins.
 | [agent/state.py](agent/state.py) | `SessionState` — the only thing carried between turns |
 | [agent/models.py](agent/models.py) | Typed domain models mirroring the fixtures |
 | [tools/](tools/) | Six tool stubs with signatures and TODOs |
-| [data/](data/) | Mock JSON fixtures: customers, orders, items, policies, returns |
-| [neo4j/](neo4j/) | Policy graph fixture + seed Cypher (not connected) |
+| [agent/graph.py](agent/graph.py) | The required Neo4j connection; raises when it is missing |
+| [data/](data/) | Mock transactional JSON only: customers, orders, items, returns |
+| [neo4j/](neo4j/) | Policy graph seed, ingestion script, reference Cypher |
 | [tests/](tests/) | Fixture-integrity tests that run; behaviour tests skipped |
 
 ## Tools
@@ -77,6 +88,10 @@ Held in [neo4j/](neo4j/) only — see [neo4j/README.md](neo4j/README.md).
 `AU_BOOKLY_EXTENDED_RETURN` is a Bookly commercial policy, deliberately not
 framed as an Australian legal right. Statutory-rights questions are escalations.
 
+[neo4j/policy_graph.json](neo4j/policy_graph.json) is seed data for ingestion
+only — it is not read at runtime. Load it with `python neo4j/ingest.py`
+(idempotent), and do that before anything asks a policy question.
+
 ## Scenarios
 
 The fixtures seed one deliberate case per behaviour worth testing. Dates assume
@@ -97,22 +112,44 @@ today is **2026-08-08**.
 
 ## Running
 
+### 1. Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Fill in `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, and the three `NEO4J_*`
+variables. All of the Neo4j ones are required — policy decisions have nowhere
+else to come from.
+
+### 2. Install dependencies
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
-
-streamlit run app.py
-pytest
 ```
 
-Neo4j is not required. Nothing reads the `NEO4J_*` variables yet.
-The app echoes input — the agent loop is not implemented.
+### 3. Ingest the policy graph
+
+```bash
+python neo4j/ingest.py
+```
+
+Idempotent. Run it again whenever `neo4j/policy_graph.json` changes.
+
+### 4. Run the app
+
+```bash
+streamlit run app.py
+```
+
+The app echoes input — the agent loop is not implemented. `pytest` runs the
+fixture and configuration tests, and needs no database of its own.
 
 ## Not built yet
 
 - Anthropic API integration (the orchestrator returns a canned reply)
-- Neo4j driver connection (the graph is a JSON fixture)
+- Eligibility queries against Neo4j (ingestion works; `search_policy` and `check_return_eligibility` are stubs)
 - All six tools — signatures and TODOs only
 - Return eligibility logic, token issuing, and rule-path construction
 - Guardrail enforcement in the orchestrator

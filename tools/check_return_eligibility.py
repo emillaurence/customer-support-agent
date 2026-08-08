@@ -11,9 +11,11 @@ def check_return_eligibility(order_id: str, item_id: str, customer_id: str) -> E
     This is the one place the return rules live. The agent reports the result
     verbatim; it does not reason about windows or exceptions itself.
 
-    The graph resolves which policy applies by walking from the item's category
-    to its policies, then applying whichever regional or promotional override
-    outranks the default. The hops taken become `rule_path`.
+    Neo4j resolves which policy applies by walking from the item's category to
+    its policies, then applying whichever regional or promotional override
+    outranks the default. The hops taken become `rule_path`. Neo4j is required:
+    with no graph there is no decision to report, and a guess is worse than an
+    error.
 
     Args:
         order_id: The order the item was bought on.
@@ -23,6 +25,10 @@ def check_return_eligibility(order_id: str, item_id: str, customer_id: str) -> E
     Returns:
         The decision, the policy behind it, a customer-facing explanation, the
         rule path, and — only when eligible — an `eligibility_token`.
+
+    Raises:
+        PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
+            Never returns a mocked or defaulted decision instead.
     """
     # TODO: 1. lookup_order for delivered_at, promotion_code, and product type.
     # TODO: 2. no delivered_at (in transit) -> not eligible, window has not started.

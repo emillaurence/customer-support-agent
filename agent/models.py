@@ -1,8 +1,10 @@
 """Shared domain models for the Bookly support agent.
 
-These mirror the JSON fixtures in `data/` and the policy graph in `neo4j/`.
-Types and shapes only — no business logic. `SessionState` lives in
-`agent/state.py` because it is conversation state rather than domain data.
+`Customer`, `Item`, `Order`, and `ReturnRecord` mirror the mock JSON fixtures in
+`data/`. `Policy` mirrors a `:Policy` node in Neo4j — policy data is read from
+the graph at runtime, never from JSON. Types and shapes only — no business
+logic. `SessionState` lives in `agent/state.py` because it is conversation state
+rather than domain data.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from pydantic import BaseModel, Field
 class ProductType(StrEnum):
     """Item category. Decides which policy governs a return.
 
-    Matches the `:ProductType` nodes in the policy graph.
+    Matches the `:Category` nodes in the policy graph.
     """
 
     PHYSICAL_BOOK = "PhysicalBook"
@@ -91,23 +93,32 @@ class Order(BaseModel):
 
 
 class Policy(BaseModel):
-    """A return policy rule.
+    """A return policy rule, as it exists in Neo4j.
 
-    Sourced from the policy graph, not from the order data. `window_days` of
-    None means returns are not offered at all — the absence of a window, not a
-    window of zero length.
+    One `:Policy` node's properties. Which categories a policy governs, which
+    regions override into it, and which policies it outranks are *edges*, not
+    fields — they are answered by traversal, never by a list on this model.
+
+    `window_days` of None means returns are not offered at all: the absence of
+    a window, not a window of zero length.
     """
 
     policy_id: str = Field(description="e.g. 'STANDARD_30_DAY', 'AU_BOOKLY_EXTENDED_RETURN'.")
     name: str
-    window_days: int | None = None
     summary: str
-    precedence: int = Field(default=0, description="Higher wins when several policies match.")
-    applies_to_product_types: list[ProductType] | None = None
-    applies_to_regions: list[str] | None = Field(
-        default=None, description="ISO country codes, or None for 'everywhere'."
+    window_days: int | None = None
+    window_starts_from: str | None = Field(
+        default=None, description="Which date the window runs from, e.g. 'delivered_at'."
     )
-    granted_by_promotion: str | None = None
+    precedence: int = Field(default=0, description="Higher wins when several policies match.")
+    exceptions: list[str] = Field(
+        default_factory=list, description="Reason codes the window does not apply to, e.g. 'DAMAGED_ON_ARRIVAL'."
+    )
+    promotion_code: str | None = Field(
+        default=None, description="Set when the policy is granted by a promotion."
+    )
+    promotion_active_from: date | None = None
+    promotion_active_to: date | None = None
 
 
 class EligibilityDecision(BaseModel):

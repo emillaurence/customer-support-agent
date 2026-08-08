@@ -15,9 +15,9 @@ def search_policy(
 ) -> list[Policy]:
     """Find policies that apply to a question.
 
-    Backed by the policy graph, so a query can be narrowed by what was bought,
-    where the customer is, and when it arrived — a physical book in Australia
-    during a sale matches different rules than an ebook anywhere.
+    Backed by Neo4j, so a query can be narrowed by what was bought, where the
+    customer is, and when it arrived — a physical book in Australia during a
+    sale matches different rules than an ebook anywhere.
 
     Args:
         query: Free text, e.g. "can I return a damaged book".
@@ -27,10 +27,16 @@ def search_policy(
 
     Returns:
         Matching policies, highest precedence first.
+
+    Raises:
+        PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
+            Policy text is never served from JSON, so there is nothing to
+            return in that case.
     """
-    # TODO: read neo4j/policy_graph.json for now; swap for a Cypher query later.
-    #       Keep this signature stable across that swap.
-    # TODO: filter RegionalPolicy by (:Region)-[:HAS_OVERRIDE]->(:Policy).
-    # TODO: filter PromotionalPolicy by the granting promotion's active window
-    #       against delivered_at.
+    # TODO: get_driver() and run Cypher — the graph is the only policy source.
+    # TODO: match (:Category {name: product_type})-[:GOVERNED_BY]->(:Policy).
+    # TODO: add (:Region {code: country})-[:HAS_OVERRIDE]->(:Policy).
+    # TODO: keep a promotional policy only when delivered_at falls inside
+    #       promotion_active_from..promotion_active_to.
+    # TODO: order by precedence descending; OVERRIDES edges explain the order.
     raise NotImplementedError("search_policy is a scaffold stub")

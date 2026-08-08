@@ -1,109 +1,86 @@
-// Bookly policy graph — illustrative seed.
+// Bookly policy graph — reference Cypher.
 //
-// Nothing runs this yet. It documents the exact shape that
-// policy_graph.json stands in for; the two files must stay consistent.
+// This is the same model that ingest.py writes, spelled out by hand so the
+// shape is readable without running anything. Prefer:
 //
-// Neo4j holds policy only: product categories, return policies, return
-// windows, exceptions, promotions, and regional overrides. Customers,
-// orders, items, and returns live in ../data/*.json.
+//     python neo4j/ingest.py
+//
+// which reads policy_graph.json and is idempotent. Keep this file in step with
+// that fixture; the two must not disagree.
+//
+// Neo4j holds policy only: item categories, return policies, return windows,
+// exceptions, promotions, and regional overrides. Customers, orders, items, and
+// returns live in ../data/*.json.
 
 // --- Constraints ---------------------------------------------------------
-CREATE CONSTRAINT product_type_name IF NOT EXISTS
-  FOR (t:ProductType) REQUIRE t.name IS UNIQUE;
-CREATE CONSTRAINT region_code IF NOT EXISTS
-  FOR (r:Region) REQUIRE r.code IS UNIQUE;
+CREATE CONSTRAINT category_name IF NOT EXISTS
+  FOR (c:Category) REQUIRE c.name IS UNIQUE;
 CREATE CONSTRAINT policy_id IF NOT EXISTS
   FOR (p:Policy) REQUIRE p.policy_id IS UNIQUE;
-CREATE CONSTRAINT return_window_id IF NOT EXISTS
-  FOR (w:ReturnWindow) REQUIRE w.window_id IS UNIQUE;
-CREATE CONSTRAINT promotion_code IF NOT EXISTS
-  FOR (pr:Promotion) REQUIRE pr.code IS UNIQUE;
-CREATE CONSTRAINT exception_code IF NOT EXISTS
-  FOR (e:Exception) REQUIRE e.code IS UNIQUE;
+CREATE CONSTRAINT region_code IF NOT EXISTS
+  FOR (r:Region) REQUIRE r.code IS UNIQUE;
 
-// --- Product categories --------------------------------------------------
-MERGE (physical:ProductType {name: 'PhysicalBook'})
-  SET physical.returnable = true;
-MERGE (ebook:ProductType {name: 'EBook'})
-  SET ebook.returnable = false;
+// --- Item categories -----------------------------------------------------
+MERGE (physical:Category {name: 'PhysicalBook'})
+  SET physical.description = 'Printed books. Returnable, subject to a window.';
+MERGE (ebook:Category {name: 'EBook'})
+  SET ebook.description = 'Digital downloads. Not returnable once made available.';
 
 // --- Regions -------------------------------------------------------------
 MERGE (au:Region {code: 'AU'}) SET au.name = 'Australia';
 MERGE (gb:Region {code: 'GB'}) SET gb.name = 'United Kingdom';
 MERGE (us:Region {code: 'US'}) SET us.name = 'United States';
 
-// --- Return windows ------------------------------------------------------
-// Windows are nodes, not properties, so an explanation can name the window
-// it measured against: PhysicalBook -> STANDARD_30_DAY -> 30 days.
-MERGE (w30:ReturnWindow {window_id: 'WINDOW_30_DAY'})
-  SET w30.days = 30, w30.starts_from = 'delivered_at';
-MERGE (w45:ReturnWindow {window_id: 'WINDOW_45_DAY'})
-  SET w45.days = 45, w45.starts_from = 'delivered_at';
-MERGE (w60:ReturnWindow {window_id: 'WINDOW_60_DAY'})
-  SET w60.days = 60, w60.starts_from = 'delivered_at';
-
 // --- Policies ------------------------------------------------------------
+// window_days null means returns are not offered at all — the absence of a
+// window, not a window of zero length.
 MERGE (standard:Policy {policy_id: 'STANDARD_30_DAY'})
-  SET standard.name       = 'Standard 30-day returns',
-      standard.precedence = 0,
-      standard.summary    = 'Physical books may be returned within 30 days of delivery, in resalable condition.';
+  SET standard.name               = 'Standard 30-day returns',
+      standard.window_days        = 30,
+      standard.precedence         = 0,
+      standard.window_starts_from = 'delivered_at',
+      standard.exceptions         = ['DAMAGED_ON_ARRIVAL'],
+      standard.summary            = 'Physical books may be returned within 30 days of delivery, in resalable condition.';
 
 MERGE (digital:Policy {policy_id: 'DIGITAL_NO_RETURN'})
-  SET digital.name       = 'Digital purchases are final',
-      digital.precedence = 100,
-      digital.summary    = 'Ebooks cannot be returned once the download has been made available.';
+  SET digital.name        = 'Digital purchases are final',
+      digital.window_days = null,
+      digital.precedence  = 100,
+      digital.exceptions  = [],
+      digital.summary     = 'Ebooks cannot be returned once the download has been made available.';
 
 MERGE (holiday:Policy {policy_id: 'HOLIDAY_EXTENDED_RETURN'})
-  SET holiday:PromotionalPolicy,
-      holiday.name       = 'Holiday sale extended returns',
-      holiday.precedence = 5,
-      holiday.summary    = 'Physical books bought during a Bookly holiday sale may be returned within 60 days of delivery instead of 30.';
+  SET holiday.name                  = 'Holiday sale extended returns',
+      holiday.window_days           = 60,
+      holiday.precedence            = 5,
+      holiday.window_starts_from    = 'delivered_at',
+      holiday.promotion_code        = 'MIDYEAR_HOLIDAY_SALE_2026',
+      holiday.promotion_active_from = '2026-06-15',
+      holiday.promotion_active_to   = '2026-07-15',
+      holiday.exceptions            = ['DAMAGED_ON_ARRIVAL'],
+      holiday.summary               = 'Physical books bought during a Bookly holiday sale may be returned within 60 days of delivery instead of 30.';
 
 // Bookly's own goodwill extension for Australia. Deliberately NOT framed as a
 // statutory 45-day right — it is a Bookly policy and is named as one.
 MERGE (aupolicy:Policy {policy_id: 'AU_BOOKLY_EXTENDED_RETURN'})
-  SET aupolicy:RegionalPolicy,
-      aupolicy.name       = 'Bookly Australia extended returns',
-      aupolicy.precedence = 10,
-      aupolicy.summary    = "A Bookly goodwill extension: customers in Australia get 45 days on physical books instead of 30. This is Bookly's own policy, not a statement about Australian law.";
-
-// --- Promotions ----------------------------------------------------------
-MERGE (promo:Promotion {code: 'MIDYEAR_HOLIDAY_SALE_2026'})
-  SET promo.name        = 'Mid-year holiday sale 2026',
-      promo.active_from = date('2026-06-15'),
-      promo.active_to   = date('2026-07-15');
-
-// --- Exceptions ----------------------------------------------------------
-MERGE (damaged:Exception {code: 'DAMAGED_ON_ARRIVAL'})
-  SET damaged.name    = 'Damaged or faulty on arrival',
-      damaged.summary = 'A book that arrived damaged or faulty is returnable even if the window has closed. Needs human review before approval.';
+  SET aupolicy.name               = 'Bookly Australia extended returns',
+      aupolicy.window_days        = 45,
+      aupolicy.precedence         = 10,
+      aupolicy.window_starts_from = 'delivered_at',
+      aupolicy.exceptions         = ['DAMAGED_ON_ARRIVAL'],
+      aupolicy.summary            = "A Bookly goodwill extension: customers in Australia get 45 days on physical books instead of 30. This is Bookly's own policy, not a statement about Australian law.";
 
 // --- Which category is governed by which policy --------------------------
-MATCH (t:ProductType {name: 'PhysicalBook'}), (p:Policy)
+MATCH (c:Category {name: 'PhysicalBook'}), (p:Policy)
 WHERE p.policy_id IN ['STANDARD_30_DAY', 'HOLIDAY_EXTENDED_RETURN', 'AU_BOOKLY_EXTENDED_RETURN']
-MERGE (t)-[:GOVERNED_BY]->(p);
+MERGE (c)-[:GOVERNED_BY]->(p);
 
-MATCH (t:ProductType {name: 'EBook'}), (p:Policy {policy_id: 'DIGITAL_NO_RETURN'})
-MERGE (t)-[:GOVERNED_BY]->(p);
-
-// --- Which policy measures against which window --------------------------
-// DIGITAL_NO_RETURN gets no HAS_WINDOW edge. The missing edge IS the rule.
-MATCH (p:Policy {policy_id: 'STANDARD_30_DAY'}), (w:ReturnWindow {window_id: 'WINDOW_30_DAY'})
-MERGE (p)-[:HAS_WINDOW]->(w);
-
-MATCH (p:Policy {policy_id: 'AU_BOOKLY_EXTENDED_RETURN'}), (w:ReturnWindow {window_id: 'WINDOW_45_DAY'})
-MERGE (p)-[:HAS_WINDOW]->(w);
-
-MATCH (p:Policy {policy_id: 'HOLIDAY_EXTENDED_RETURN'}), (w:ReturnWindow {window_id: 'WINDOW_60_DAY'})
-MERGE (p)-[:HAS_WINDOW]->(w);
+MATCH (c:Category {name: 'EBook'}), (p:Policy {policy_id: 'DIGITAL_NO_RETURN'})
+MERGE (c)-[:GOVERNED_BY]->(p);
 
 // --- Regional overrides --------------------------------------------------
 MATCH (r:Region {code: 'AU'}), (p:Policy {policy_id: 'AU_BOOKLY_EXTENDED_RETURN'})
 MERGE (r)-[:HAS_OVERRIDE]->(p);
-
-// --- Promotional grants --------------------------------------------------
-MATCH (pr:Promotion {code: 'MIDYEAR_HOLIDAY_SALE_2026'}), (p:Policy {policy_id: 'HOLIDAY_EXTENDED_RETURN'})
-MERGE (pr)-[:GRANTS]->(p);
 
 // --- Precedence, as edges ------------------------------------------------
 // "Which rule wins" is data, not if-statements scattered through tool code,
@@ -115,39 +92,28 @@ MATCH (a:Policy {policy_id: 'AU_BOOKLY_EXTENDED_RETURN'}), (other:Policy)
 WHERE other.policy_id IN ['STANDARD_30_DAY', 'HOLIDAY_EXTENDED_RETURN']
 MERGE (a)-[:OVERRIDES]->(other);
 
-// Nothing OVERRIDES DIGITAL_NO_RETURN. An ebook cannot be rescued by region
-// or promotion, and that is expressed by the absence of an edge.
+// Nothing OVERRIDES DIGITAL_NO_RETURN, and it has no window. An ebook cannot be
+// rescued by a region or a promotion, and that is expressed by absence.
 
-// --- Exception waivers ---------------------------------------------------
-MATCH (e:Exception {code: 'DAMAGED_ON_ARRIVAL'}), (p:Policy)
-WHERE p.policy_id IN ['STANDARD_30_DAY', 'AU_BOOKLY_EXTENDED_RETURN', 'HOLIDAY_EXTENDED_RETURN']
-MERGE (e)-[:WAIVES]->(p);
+// --- Verify --------------------------------------------------------------
+// MATCH (a)-[r]->(b)
+// RETURN a, r, b;
 
-// A faulty ebook is an escalation, not a return — so DAMAGED_ON_ARRIVAL
-// deliberately does not WAIVE DIGITAL_NO_RETURN.
-
-// --- Example reads (for the eligibility tool, Phase 3) -------------------
+// --- Example reads (for the eligibility tool, not implemented yet) -------
 //
-// 1. Which policies could apply to a physical book for an AU customer?
+// 1. Which policies could apply to a category for a customer in $country?
 //
-// MATCH (t:ProductType {name: $product_type})-[:GOVERNED_BY]->(p:Policy)
-// WHERE NOT p:RegionalPolicy
-//    OR (:Region {code: $country})-[:HAS_OVERRIDE]->(p)
+// MATCH (c:Category {name: $category})-[:GOVERNED_BY]->(p:Policy)
+// WHERE NOT EXISTS { (:Region)-[:HAS_OVERRIDE]->(p) }
+//    OR EXISTS { (:Region {code: $country})-[:HAS_OVERRIDE]->(p) }
 // RETURN p ORDER BY p.precedence DESC;
 //
-// 2. The winning policy plus its window and the rules it beat — the
-//    explainable path behind EligibilityDecision.rule_path.
+// 2. The winning policy plus the rules it beat — the explainable path behind
+//    EligibilityDecision.rule_path.
 //
-// MATCH (t:ProductType {name: $product_type})-[:GOVERNED_BY]->(p:Policy)
-// WHERE NOT p:RegionalPolicy
-//    OR (:Region {code: $country})-[:HAS_OVERRIDE]->(p)
+// MATCH (c:Category {name: $category})-[:GOVERNED_BY]->(p:Policy)
+// WHERE NOT EXISTS { (:Region)-[:HAS_OVERRIDE]->(p) }
+//    OR EXISTS { (:Region {code: $country})-[:HAS_OVERRIDE]->(p) }
 // WITH p ORDER BY p.precedence DESC LIMIT 1
-// OPTIONAL MATCH (p)-[:HAS_WINDOW]->(w:ReturnWindow)
 // OPTIONAL MATCH (p)-[:OVERRIDES]->(beaten:Policy)
-// RETURN p.policy_id, w.days, collect(beaten.policy_id) AS overrides;
-//
-// 3. Is a promotional policy actually live for this delivery date?
-//
-// MATCH (pr:Promotion)-[:GRANTS]->(p:Policy {policy_id: $policy_id})
-// WHERE $delivered_at >= pr.active_from AND $delivered_at <= pr.active_to
-// RETURN pr.code;
+// RETURN p.policy_id, p.window_days, collect(beaten.policy_id) AS overrides;
