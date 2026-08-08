@@ -55,7 +55,7 @@ tool fails. It never degrades to a fixture or returns a mocked decision.
 | [lookup_order](tools/lookup_order.py) | Fetch an order and its line items |
 | [search_policy](tools/search_policy.py) | Find the policy relevant to a question |
 | [check_return_eligibility](tools/check_return_eligibility.py) | Decide if an item can be returned, and why |
-| [initiate_return](tools/initiate_return.py) | Create a return record |
+| [initiate_return](tools/initiate_return.py) | Create a return record — requires an eligibility token *and* `confirmed=True` |
 | [escalate_to_human](tools/escalate_to_human.py) | Hand off to a human agent |
 
 ## Session state
@@ -73,6 +73,11 @@ verify → find the order → pick the item → check eligibility → confirm �
 A write needs all three gates: identity, an eligibility token, and an explicit
 confirmation. Switching order or item clears the token, so it can never be spent
 on a different item.
+
+Session state is not the safety boundary. `confirmed` is kept here for the
+conversation flow, but [initiate_return](tools/initiate_return.py) takes
+`eligibility_token` and `confirmed` as arguments and refuses on its own, so an
+orchestrator bug cannot produce a write the customer never agreed to.
 
 ## Policy model
 

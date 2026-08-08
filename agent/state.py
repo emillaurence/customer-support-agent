@@ -59,7 +59,11 @@ class SessionState(BaseModel):
     )
     confirmed: bool = Field(
         default=False,
-        description="True once the customer has explicitly said yes to the described action.",
+        description=(
+            "True once the customer has explicitly said yes to the described action. "
+            "Bookkeeping only — it must be passed explicitly to initiate_return, which "
+            "does its own check and never reads session state."
+        ),
     )
     escalated: bool = Field(
         default=False,
@@ -77,6 +81,10 @@ class SessionState(BaseModel):
 
         Three gates, all required: identity, a passing eligibility check with a
         token, and an explicit confirmation from the customer.
+
+        This is the orchestrator's own check, not the safety boundary. The write
+        tool re-checks: `initiate_return` takes `eligibility_token` and
+        `confirmed` as arguments, so a bug here cannot let a mutation through.
         """
         return self.is_verified and self.eligibility_token is not None and self.confirmed
 

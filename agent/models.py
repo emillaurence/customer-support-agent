@@ -126,7 +126,9 @@ class EligibilityDecision(BaseModel):
 
     The agent quotes `explanation` to the customer rather than inventing its
     own justification, and passes `eligibility_token` to `initiate_return` so a
-    mutation cannot happen without a check that actually said yes.
+    mutation cannot happen without a check that actually said yes. The token is
+    necessary but not sufficient: `initiate_return` also requires an explicit
+    `confirmed=True`.
 
     `rule_path` is the graph traversal behind the answer — the ordered hops
     from item category to winning policy — so the decision is explainable
@@ -142,7 +144,7 @@ class EligibilityDecision(BaseModel):
     )
     eligibility_token: str | None = Field(
         default=None,
-        description="Issued only when eligible. Required by initiate_return.",
+        description="Issued only when eligible. Required by initiate_return, alongside confirmed=True.",
     )
     days_remaining: int | None = None
     requires_human: bool = Field(

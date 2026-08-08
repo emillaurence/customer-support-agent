@@ -17,7 +17,8 @@ def test_order_details_withheld_before_verification() -> None:
 
 def test_return_not_initiated_without_eligibility() -> None:
     """initiate_return refuses even if the agent calls it directly."""
-    # TODO: expect ValueError with no eligibility_token, for ORD-1004 / ITEM-200
+    # TODO: expect ValueError with no eligibility_token, for ORD-1004 / ITEM-200,
+    #       even when confirmed=True
     ...
 
 
@@ -27,8 +28,26 @@ def test_eligibility_token_is_bound_to_one_item() -> None:
     ...
 
 
-def test_mutation_requires_explicit_confirmation() -> None:
-    """A token is not enough — the customer must have said yes."""
+def test_return_without_explicit_confirmation_is_blocked() -> None:
+    """A valid token is not enough — the customer must have said yes.
+
+    The check belongs to the tool, not the session: calling initiate_return with
+    confirmed=False must be refused even when every other precondition holds.
+    """
+    # TODO: verified CUST-001, valid token for ORD-1001 / ITEM-101,
+    #       initiate_return(..., confirmed=False) -> refused, and no record written
+    #       to data/returns.json
+    ...
+
+
+def test_confirmation_is_not_taken_from_session_state() -> None:
+    """state.confirmed being True does not by itself authorise a write.
+
+    Guards against the confirmation gate quietly moving back into SessionState:
+    the value has to arrive as an argument.
+    """
+    # TODO: state.confirmed True but initiate_return called with confirmed=False
+    #       -> still refused
     # TODO: state.may_mutate is False until state.confirmed is True
     ...
 
