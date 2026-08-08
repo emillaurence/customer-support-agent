@@ -10,6 +10,12 @@ Two things make the tool tests deterministic:
   `data/`, so `initiate_return` can be tested for real without a passing test run
   leaving an RMA in the repo.
 
+For the Phase 4 agent tests there is a third: **a stand-in for Anthropic.**
+`FakeAnthropic` replays a script of responses instead of calling the API, so the
+tool loop, the routing, the confirmation gate, and the tracing are all exercised
+end to end with no network, no key, and no model non-determinism. What is being
+tested is the orchestrator's behaviour given a model's output — not the model.
+
 `seeded_graph` is the offline stand-in for Neo4j. It answers the one policy query
 the tools make, built from `neo4j/policy_graph.json` — the same seed that was
 ingested into the database — so unit tests exercise the real decision logic
@@ -19,14 +25,21 @@ the live graph, which is what proves the stub is honest.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import shutil
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from agent.config import AnthropicConfig
+from agent.orchestrator import BooklyAgent
+from agent.state import SessionState
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY_SEED = ROOT / "neo4j" / "policy_graph.json"
@@ -155,6 +168,148 @@ def break_policy_graph(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for module in _policy_reading_modules():
         monkeypatch.setattr(module, "fetch_policies_for_category", unavailable)
+
+
+# --- Offline Anthropic ---------------------------------------------------
+
+
+@dataclass
+class FakeBlock:
+    """One content block, with just the fields the orchestrator reads.
+
+    Deliberately not an SDK type. The orchestrator reads blocks by attribute
+    rather than by class, so a plain object is enough — and building responses
+    by hand is what lets a test say "the model asked for verify_identity, then
+    replied" without a network call.
+    """
+
+    type: str
+    text: str = ""
+    id: str = ""
+    name: str = ""
+    input: dict[str, Any] = dataclass_field(default_factory=dict)
+
+
+@dataclass
+class FakeResponse:
+    """One Anthropic response: a list of content blocks."""
+
+    content: list[FakeBlock]
+
+
+def text(body: str) -> FakeResponse:
+    """A response that is just an assistant reply."""
+    return FakeResponse(content=[FakeBlock(type="text", text=body)])
+
+
+def tool_call(name: str, tool_input: dict[str, Any], block_id: str = "toolu_1", say: str = "") -> FakeResponse:
+    """A response asking for one tool, optionally with a line of text first."""
+    blocks = [FakeBlock(type="text", text=say)] if say else []
+    blocks.append(FakeBlock(type="tool_use", id=block_id, name=name, input=tool_input))
+    return FakeResponse(content=blocks)
+
+
+def tool_calls(*calls: tuple[str, dict[str, Any]]) -> FakeResponse:
+    """A response asking for several tools at once, as the API allows."""
+    return FakeResponse(
+        content=[
+            FakeBlock(type="tool_use", id=f"toolu_{index}", name=name, input=args)
+            for index, (name, args) in enumerate(calls)
+        ]
+    )
+
+
+class FakeMessages:
+    """The `client.messages` namespace: hands back the next scripted response."""
+
+    def __init__(self, responses: list[FakeResponse], error: Exception | None = None) -> None:
+        self._responses = list(responses)
+        self._error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> FakeResponse:
+        """Record the request and return the next scripted response.
+
+        The request is deep-copied before it is recorded. The orchestrator hands
+        its live transcript straight to the client, so holding a reference would
+        mean every recorded call aliased the same growing list and a test could
+        only ever inspect the final state.
+
+        Raises:
+            Exception: The configured error, if one was given — this is how the
+                API-unavailable path is tested.
+            AssertionError: If the loop asked for more responses than the script
+                holds, which means the orchestrator looped further than the test
+                expected.
+        """
+        self.calls.append(copy.deepcopy(kwargs))
+        if self._error is not None:
+            raise self._error
+        assert self._responses, "the agent asked for more model responses than the script provides"
+        return self._responses.pop(0)
+
+
+class FakeAnthropic:
+    """A stand-in Anthropic client that replays a script.
+
+    Exposes the one method the orchestrator uses, plus the recorded calls so a
+    test can assert on which model was used and what was sent.
+    """
+
+    def __init__(self, *responses: FakeResponse, error: Exception | None = None) -> None:
+        self.messages = FakeMessages(list(responses), error)
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        """Every request the agent made, in order."""
+        return self.messages.calls
+
+    @property
+    def models_used(self) -> list[str]:
+        """The model id on each request, in order."""
+        return [call["model"] for call in self.messages.calls]
+
+
+@pytest.fixture
+def anthropic_config() -> AnthropicConfig:
+    """Configuration with recognisable placeholder model names.
+
+    Not real model ids: the point is that the orchestrator uses whatever the
+    environment gave it, so the test asserts on these strings rather than on any
+    particular Claude release.
+    """
+    return AnthropicConfig(
+        api_key="sk-ant-test-not-a-real-key",
+        haiku_model="test-haiku-model",
+        sonnet_model="test-sonnet-model",
+    )
+
+
+@pytest.fixture
+def make_agent(anthropic_config: AnthropicConfig):
+    """Build a `BooklyAgent` wired to a scripted client and the fixed clock."""
+
+    def build(*responses: FakeResponse, error: Exception | None = None) -> tuple[Any, FakeAnthropic]:
+        client = FakeAnthropic(*responses, error=error)
+        agent = BooklyAgent(config=anthropic_config, client=client, clock=FIXED_NOW)
+        return agent, client
+
+    return build
+
+
+@pytest.fixture
+def verified_state() -> SessionState:
+    """A session where CUST-001 has already been verified.
+
+    Saves every order test from replaying the identity turn. CUST-001 has one
+    active order, so nothing here is ambiguous.
+    """
+    return SessionState(
+        verified_customer_id="CUST-001",
+        customer_region="GB",
+        active_order_ids=["ORD-1001"],
+        active_order_id="ORD-1001",
+    )
 
 
 @pytest.fixture

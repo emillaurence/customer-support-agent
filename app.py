@@ -3,6 +3,11 @@
 Thin on purpose: render the transcript, take one message, hand it to the agent.
 All logic lives in `agent/` and `tools/`.
 
+Still deliberately plain. The agent trace and the model-routing display are
+Phase 6 — the data for both is already being captured on `SessionState`
+(`tool_traces`, `model_turns`), so that phase is a rendering job and not a
+change to the loop.
+
 Run with: streamlit run app.py
 """
 
@@ -10,6 +15,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from agent.config import AnthropicConfigError
 from agent.orchestrator import BooklyAgent
 from agent.state import SessionState
 
@@ -24,7 +30,12 @@ def get_session() -> SessionState:
 
 
 def get_agent() -> BooklyAgent:
-    """Fetch the agent, constructing it once per session."""
+    """Fetch the agent, constructing it once per session.
+
+    Construction reads and validates the Anthropic configuration, so a missing
+    key or model name stops here with an explanation rather than failing on the
+    customer's first message.
+    """
     if "bookly_agent" not in st.session_state:
         st.session_state.bookly_agent = BooklyAgent()
     return st.session_state.bookly_agent
@@ -33,10 +44,14 @@ def get_agent() -> BooklyAgent:
 def main() -> None:
     """Render the chat UI and drive one turn per submission."""
     state = get_session()
-    agent = get_agent()
 
     st.title("📚 Bookly Support")
-    st.caption("Scaffold — the agent loop is not wired up yet.")
+
+    try:
+        agent = get_agent()
+    except AnthropicConfigError as exc:
+        st.error(str(exc))
+        st.stop()
 
     with st.sidebar:
         st.subheader("Session")
@@ -47,6 +62,13 @@ def main() -> None:
         st.write("Eligibility:", state.eligibility.policy_id if state.eligibility else "—")
         st.write("Confirmed:", state.confirmed)
         st.write("Escalated:", state.escalated)
+
+        st.subheader("Routing")
+        last_turn = state.model_turns[-1] if state.model_turns else None
+        st.write("Last turn:", last_turn.model_tier if last_turn else "—")
+        st.write("Because:", last_turn.routing_reason if last_turn else "—")
+        st.write("Tool calls:", len(state.tool_traces))
+
         if st.button("Reset conversation"):
             st.session_state.pop("bookly_state", None)
             st.rerun()
@@ -58,9 +80,12 @@ def main() -> None:
     if prompt := st.chat_input("How can we help?"):
         with st.chat_message("user"):
             st.markdown(prompt)
-        reply = agent.respond(state, prompt)
+        with st.spinner("…"):
+            reply = agent.respond(state, prompt)
         with st.chat_message("assistant"):
             st.markdown(reply)
+        # The sidebar was drawn before this turn ran; rerun so it reflects it.
+        st.rerun()
 
 
 if __name__ == "__main__":
