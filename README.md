@@ -72,7 +72,7 @@ Six files hold the whole system. Read them in this order.
 | [policy/policy.py](policy/policy.py) | **Where business policy lives.** Region normalization, applicability, precedence, rule paths, and `search_policy` — the one selection both policy tools read |
 | [policy/graph.py](policy/graph.py) | The required Neo4j connection and the one policy query; raises when it is missing |
 | [ui.py](ui.py) | **How the demo is rendered.** Theme, trace formatting, trace-to-turn mapping, and the Streamlit calls |
-| [app.py](app.py) | The Streamlit entry point — transcript in, one turn out |
+| [app.py](app.py) | The Streamlit entry point — transcript in, one turn out; also where logging is configured |
 | [.streamlit/config.toml](.streamlit/config.toml) | The palette, as Streamlit's own theming |
 | [scripts/reset_demo.py](scripts/reset_demo.py) | `python scripts/reset_demo.py` — the command line around `agent.tools.reset_demo` |
 | [data/](data/) | Mock transactional JSON only: customers, orders, items, returns |
@@ -86,8 +86,8 @@ All six are in [agent/tools.py](agent/tools.py), in this order.
 
 | Tool | Purpose | Reads |
 | --- | --- | --- |
-| `verify_identity` | Verify by email; returns `customer_id`, region, and active order ids | JSON |
-| `lookup_order` | Fetch one owned order, its items, and its shipment | JSON |
+| `verify_identity` | Verify by email; returns `customer_id`, first name, and region. Identity only | JSON |
+| `lookup_order` | Without `order_id`, list the customer's orders and the items on each; with one, that order, its items, and its shipment | JSON |
 | `search_policy` | Informational policy retrieval — what the rules *are* (body in [policy/policy.py](policy/policy.py)) | Neo4j |
 | `check_return_eligibility` | The deterministic decision for one item on one order | Neo4j + JSON |
 | `initiate_return` | The only write. Needs a bound eligibility token *and* `confirmed=True` | JSON |
@@ -269,6 +269,23 @@ Traces record **observable execution, not reasoning**. Nothing carries
 chain-of-thought, the Anthropic key, the Neo4j password, or a spendable
 eligibility token. Email addresses are masked to `a***@example.com`.
 
+Beside the trace, and separate from it, is an operational log: `logs/bookly.log`,
+written by Python's `logging` through a `RotatingFileHandler` (1 MB, three
+backups) that [app.py](app.py) installs at startup. Startup, Neo4j warm-up, the
+tier and reason each turn routed on, and one line per tool call — its status,
+latency, sanitized arguments, and the policy, RMA, or case id it produced. It
+reads the *same* sanitized values as the trace, so nothing lands there that the
+trace would not show either. The trace is what a reviewer reads about one
+conversation; the log is what an operator greps afterwards. The UI never reads
+it, and it is git-ignored.
+
+```
+2026-08-09 10:25:31 INFO agent session=SESS-7B8DD378 model=sonnet route="return or refund workflow"
+2026-08-09 10:25:32 INFO tool name=verify_identity status=success latency_ms=0.2 args={'email': 'b***@example.com'}
+2026-08-09 10:25:32 INFO tool name=lookup_order status=success latency_ms=0.2 args={'customer_id': 'CUST-002'}
+2026-08-09 10:25:32 INFO tool name=check_return_eligibility status=success latency_ms=34.2 args={'order_id': 'ORD-1003', 'item_id': 'ITEM-201', 'customer_id': 'CUST-002'} policy=DIGITAL_NO_RETURN eligible=false
+```
+
 ## The UI
 
 The conversation is the page. Under each assistant reply there is one quiet line
@@ -401,12 +418,17 @@ One session, five turns, no script:
 | Turn | The customer | What happens | Model |
 | --- | --- | --- | --- |
 | 1 | "Where's my book?" | Not verified, so the agent asks for the email | Haiku |
-| 2 | "ada@example.com" | `verify_identity` → two live orders → both looked up → *which one?* | Haiku |
-| 3 | "The Pragmatic Programmer one" | Selected by title; `lookup_order` reads out the status | Haiku |
+| 2 | "ada@example.com" | `verify_identity`, then `lookup_order` with no order id → two live orders → *which one?* | Haiku |
+| 3 | "The Pragmatic Programmer one" | Selected by title; `lookup_order` reads that order's status out | Haiku |
 | 4 | "Actually, I want to return it." | `check_return_eligibility` → eligible → *shall I start it?* | Sonnet |
 | 5 | "Yes please" | `initiate_return` → a real RMA in `data/returns.json` | Sonnet |
 
     verify_identity → lookup_order → check_return_eligibility → initiate_return
+
+A customer who names their book skips the question: if the listing resolves the
+title to exactly one item, the agent goes straight to eligibility rather than
+asking them to confirm a choice they already made, and does not re-read the
+order for detail nobody asked for. Ambiguity is what gets a question.
 
 The wording is not load-bearing. "Can you check my delivery?", "I haven't
 received my book yet", "Can I send this back?", "Can I get a refund?", "Go

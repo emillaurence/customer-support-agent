@@ -1,7 +1,7 @@
 """The six things the Bookly agent can do, and the boundary Claude reaches them through.
 
     verify_identity           who the customer is
-    lookup_order              one order they own, and what is on it
+    lookup_order              the orders they own, or one of them in detail
     search_policy             what the rules are          (body in policy/policy.py)
     check_return_eligibility  whether one item can go back
     initiate_return           the only write
@@ -49,6 +49,7 @@ from agent.state import (
 from policy.graph import PolicyGraphUnavailableError
 from policy.policy import (
     PolicyContext,
+    ProductType,
     applicable_policies,
     build_rule_path,
     resolve_region,
@@ -57,11 +58,12 @@ from policy.policy import (
 
 __all__ = [
     "TOOL_SCHEMAS",
+    "CustomerOrders",
+    "ItemSummary",
     "OrderSummary",
     "ReturnBlockedError",
     "ToolOutcome",
     "active_order_ids",
-    "active_order_summaries",
     "apply_tool_result",
     "check_return_eligibility",
     "escalate_to_human",
@@ -216,45 +218,20 @@ def _clear_eligibility_tokens() -> None:
 # --- 1. verify_identity --------------------------------------------------
 
 
-class OrderSummary(BaseModel):
-    """Just enough of an order to ask "which one did you mean?".
-
-    The id to name it by, the titles a customer would recognise, and the status
-    they can already see in their account. **Not an order** — no dates, no prices,
-    no line items, no promotion. Anything the agent says *about* an order still
-    comes from `lookup_order`.
-    """
-
-    order_id: str
-    status: OrderStatus
-    items: list[str] = Field(default_factory=list, description="Titles, in catalogue order.")
-
-
 class VerifyIdentityResult(BaseModel):
-    """Who the customer is, which region's policy applies, and which orders are
-    theirs to talk about.
+    """Who the customer is, and which region's policy applies to them.
 
-    `active_orders` carries titles as well as ids because the alternative was
-    worse: the agent used to call `lookup_order` on *every* live order just to
-    name the books in its clarifying question, so a customer with two orders paid
-    for two full order reads before being asked which one they meant. Naming them
-    is cheap; describing them is still `lookup_order`'s job.
+    Identity and nothing else. Which orders they have is a question about orders,
+    and `lookup_order` answers it — a verification that also listed orders was two
+    tools wearing one name, and the caller could not ask either question on its
+    own.
     """
 
     verified: bool
     customer_id: str | None = None
+    name: str | None = Field(default=None, description="First name, for addressing them.")
     region: str | None = None
-    active_orders: list[OrderSummary] = Field(
-        default_factory=list,
-        description="More than one means the agent must ask which, by title.",
-    )
     message: str = ""
-
-    @property
-    def active_order_ids(self) -> list[str]:
-        """The ids alone. A property rather than a field, so it never doubles the
-        order list in the JSON the model reads."""
-        return [order.order_id for order in self.active_orders]
 
 
 def verify_identity(email: str) -> VerifyIdentityResult:
@@ -283,50 +260,51 @@ def verify_identity(email: str) -> VerifyIdentityResult:
             message="I can't find an account for that email address. Could you double-check it?",
         )
 
+    first_name = customer.name.split()[0]
     return VerifyIdentityResult(
         verified=True,
         customer_id=customer.customer_id,
+        name=first_name,
         region=customer.country,
-        active_orders=active_order_summaries(customer.customer_id),
-        message=f"Thanks {customer.name.split()[0]} — I've found your account.",
+        message=f"Thanks {first_name} — I've found your account.",
     )
 
 
-def active_order_summaries(customer_id: str) -> list[OrderSummary]:
-    """The customer's live (not cancelled) orders, most recently placed first.
-
-    Sorted so the agent has a sensible order to read them in — but it must still
-    *ask* when there is more than one. One pass over the catalogue for the whole
-    list, rather than a read per order.
-    """
-    orders = [
-        order
-        for order in _load_orders()
-        if order.customer_id == customer_id and order.status != OrderStatus.CANCELLED
-    ]
-    orders.sort(key=lambda order: order.placed_at, reverse=True)
-
-    catalogue = _load_items() if orders else {}
-    return [
-        OrderSummary(
-            order_id=order.order_id,
-            status=order.status,
-            items=[
-                catalogue[line.item_id].title
-                for line in order.items
-                if line.item_id in catalogue
-            ],
-        )
-        for order in orders
-    ]
-
-
-def active_order_ids(customer_id: str) -> list[str]:
-    """The ids of the customer's live orders, most recently placed first."""
-    return [summary.order_id for summary in active_order_summaries(customer_id)]
-
-
 # --- 2. lookup_order -----------------------------------------------------
+#
+# Two modes, one tool, one ownership rule. Without an order id it lists the
+# customer's live orders; with one it reads that order in full. Both start from
+# `customer_id`, so neither can answer for someone else's account.
+
+
+class ItemSummary(BaseModel):
+    """One line item, named the way a customer would name it and identified the
+    way a tool needs it."""
+
+    item_id: str
+    title: str
+    product_type: ProductType
+
+
+class OrderSummary(BaseModel):
+    """Just enough of an order to find the one the customer means.
+
+    The id to name it by, the status they can already see, and the items on it
+    with their ids — so a title the customer named resolves to something
+    actionable without a second call. **Not an order**: no dates, no prices, no
+    quantities, no promotion. Anything the agent *says* about an order comes from
+    the detailed mode.
+    """
+
+    order_id: str
+    status: OrderStatus
+    items: list[ItemSummary] = Field(default_factory=list, description="In catalogue order.")
+
+
+class CustomerOrders(BaseModel):
+    """Every order the customer could be talking about, newest first."""
+
+    orders: list[OrderSummary] = Field(default_factory=list)
 
 
 class Shipment(BaseModel):
@@ -351,16 +329,23 @@ class OrderDetails(BaseModel):
 
 
 def lookup_order(
-    order_id: str, customer_id: str, now: datetime | None = None
-) -> OrderDetails | None:
-    """Look up one order belonging to a verified customer.
+    customer_id: str, order_id: str | None = None, now: datetime | None = None
+) -> CustomerOrders | OrderDetails | None:
+    """Look up a verified customer's orders, or one of them in detail.
 
-    `customer_id` is required, not optional: ownership is enforced here rather
-    than trusted to the caller, so a hallucinated or overheard order number cannot
-    read out someone else's order. A real order owned by someone else returns None
-    — the same answer as a number that does not exist, so the response cannot be
-    used to discover whether an id is real.
+    Omit `order_id` to discover what they have: their live orders, each with the
+    items on it, which is what turns "Clean Architecture" into an order id and an
+    item id. Pass one to read that order in full.
+
+    `customer_id` is required and comes first, not optional: ownership is enforced
+    here rather than trusted to the caller, so a hallucinated or overheard order
+    number cannot read out someone else's order. A real order owned by someone
+    else returns None — the same answer as a number that does not exist, so the
+    response cannot be used to discover whether an id is real.
     """
+    if order_id is None:
+        return CustomerOrders(orders=_order_summaries(customer_id))
+
     order = next(
         (
             candidate
@@ -389,6 +374,41 @@ def lookup_order(
             days_since_delivery=(today - order.delivered_at).days if arrived else None,
         ),
     )
+
+
+def _order_summaries(customer_id: str) -> list[OrderSummary]:
+    """The customer's live (not cancelled) orders, most recently placed first.
+
+    Sorted so the agent has a sensible order to read them in. One pass over the
+    catalogue for the whole list, rather than a read per order.
+    """
+    orders = [
+        order
+        for order in _load_orders()
+        if order.customer_id == customer_id and order.status != OrderStatus.CANCELLED
+    ]
+    orders.sort(key=lambda order: order.placed_at, reverse=True)
+
+    catalogue = _load_items() if orders else {}
+    return [
+        OrderSummary(
+            order_id=order.order_id,
+            status=order.status,
+            items=[
+                ItemSummary(
+                    item_id=item.item_id, title=item.title, product_type=item.product_type
+                )
+                for line in order.items
+                if (item := catalogue.get(line.item_id)) is not None
+            ],
+        )
+        for order in orders
+    ]
+
+
+def active_order_ids(customer_id: str) -> list[str]:
+    """The ids of the customer's live orders, most recently placed first."""
+    return [summary.order_id for summary in _order_summaries(customer_id)]
 
 
 def _item_on_order(order: Order, item_id: str) -> bool:
@@ -435,7 +455,7 @@ def check_return_eligibility(
         return _refuse("I need to verify your account before I can look at a return.")
 
     # Ownership is enforced here too, not assumed from the caller.
-    details = lookup_order(order_id, customer_id, now=now)
+    details = lookup_order(customer_id, order_id, now=now)
     if details is None:
         return _refuse(f"I can't find order {order_id} on your account.")
 
@@ -609,7 +629,7 @@ def initiate_return(
     if customer is None:
         raise ReturnBlockedError(f"unknown customer {customer_id}: identity is not verified.")
 
-    details = lookup_order(order_id, customer_id)
+    details = lookup_order(customer_id, order_id)
     if details is None:
         raise ReturnBlockedError(
             f"order {order_id} does not belong to {customer_id}, or does not exist."
@@ -713,8 +733,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Identify the customer by the email address on their Bookly account. Required "
             "before anything account-specific. Returns whether it matched and, if so, their "
-            "active orders with the titles on each — enough to ask which order they mean "
-            "without looking any of them up."
+            "first name and region. It says nothing about their orders — use lookup_order "
+            "for those."
         ),
         "input_schema": {
             "type": "object",
@@ -730,16 +750,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "lookup_order",
         "description": (
-            "Read one order the customer has already identified: status, dates, and the items "
-            "on it with their item ids. Everything you say about an order comes from here. "
-            "Look up the order they chose, not every order they have."
+            "The verified customer's orders. Omit order_id to list them all with the items on "
+            "each and their item ids — use that to find the book they named. Pass order_id to "
+            "read one order in full: dates, delivery, and status. Everything you say about an "
+            "order comes from here."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "order_id": {"type": "string", "description": "The order to read, e.g. 'ORD-1001'."}
+                "order_id": {
+                    "type": "string",
+                    "description": (
+                        "One order to read in detail, e.g. 'ORD-1001'. Omit to list their "
+                        "orders instead."
+                    ),
+                }
             },
-            "required": ["order_id"],
+            "required": [],
         },
     },
     {
@@ -1014,7 +1041,21 @@ def _handle_verify_identity(args: dict, state: SessionState, now) -> ToolOutcome
 
 
 def _handle_lookup_order(args: dict, state: SessionState, now) -> ToolOutcome:
-    used = {"order_id": args["order_id"], "customer_id": state.verified_customer_id}
+    customer_id = state.verified_customer_id
+
+    if not args.get("order_id"):
+        # Discovery. Already the compact shape — ids, statuses, and the titles a
+        # customer would recognise — so there is nothing to project away.
+        orders = lookup_order(customer_id)
+        return ToolOutcome(
+            status=ToolStatus.OK,
+            content=orders.model_dump_json(),
+            summary=f"{len(orders.orders)} order(s)",
+            payload=orders,
+            args_used={"customer_id": customer_id},
+        )
+
+    used = {"customer_id": customer_id, "order_id": args["order_id"]}
     result = lookup_order(**used, now=now)
     if result is None:
         # Not found and not-yours are the same answer, deliberately. Saying which
@@ -1212,12 +1253,17 @@ def apply_tool_result(
     if name == "verify_identity" and payload.verified:
         state.verified_customer_id = payload.customer_id
         state.customer_region = payload.region
-        state.active_order_ids = list(payload.active_order_ids)
-        # One live order is not ambiguous, so adopt it. Two or more and the agent
-        # has to ask — leaving `active_order_id` None is what makes the
-        # order-specific tools unusable until it does.
-        if len(payload.active_order_ids) == 1:
-            state.active_order_id = payload.active_order_ids[0]
+
+    elif name == "lookup_order" and isinstance(payload, CustomerOrders):
+        state.active_order_ids = [order.order_id for order in payload.orders]
+        # One live order is not ambiguous, so adopt it — and if that order holds
+        # one item, neither is the item. Two or more and the agent has to ask;
+        # leaving these None is what makes the order-specific tools unusable until
+        # it does. Deterministic either way: the data decides, not the model.
+        if len(payload.orders) == 1:
+            state.active_order_id = payload.orders[0].order_id
+            if len(payload.orders[0].items) == 1:
+                state.active_item_id = payload.orders[0].items[0].item_id
 
     elif name == "lookup_order" and adopt_active_order:
         state.active_order_id = payload.order.order_id

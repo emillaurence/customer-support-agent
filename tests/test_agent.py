@@ -13,6 +13,7 @@ return is open" when nothing was written is worse than one that crashes.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from agent.agent import (
     COMPLEX_TURN_COUNT,
+    LOG,
     FALLBACK_STUCK,
     FALLBACK_UNAVAILABLE,
     MAX_TOKENS,
@@ -803,42 +805,56 @@ def test_policy_search_works_without_verification(make_agent, seeded_graph) -> N
     assert state.tool_traces[0].status is ToolStatus.OK
 
 
-def test_single_active_order_is_adopted(make_agent) -> None:
-    """One live order is not ambiguous, so there is nothing to ask about.
+def test_a_single_order_holding_a_single_item_is_adopted(make_agent) -> None:
+    """One live order with one book on it is not ambiguous, so there is nothing to
+    ask about — and the item is settled along with the order.
 
-    No fixture customer has only one — the data makes the ambiguous case the
+    No fixture customer has only one order — the data makes the ambiguous case the
     default — so this is exercised through a customer who does.
     """
-    from agent.tools import OrderSummary, ToolOutcome, VerifyIdentityResult, apply_tool_result
+    from agent.tools import (
+        CustomerOrders,
+        ItemSummary,
+        OrderSummary,
+        ToolOutcome,
+        apply_tool_result,
+    )
 
     state = SessionState()
-    result = VerifyIdentityResult(
-        verified=True,
-        customer_id="CUST-009",
-        region="GB",
-        active_orders=[
-            OrderSummary(order_id="ORD-2001", status="delivered", items=["Some Book"])
-        ],
+    result = CustomerOrders(
+        orders=[
+            OrderSummary(
+                order_id="ORD-2001",
+                status="delivered",
+                items=[
+                    ItemSummary(
+                        item_id="ITEM-900", title="Some Book", product_type="PhysicalBook"
+                    )
+                ],
+            )
+        ]
     )
     apply_tool_result(
-        "verify_identity",
-        {"email": "solo@example.com"},
-        ToolOutcome(status=ToolStatus.OK, content="{}", summary="verified=True", payload=result),
+        "lookup_order",
+        {},
+        ToolOutcome(status=ToolStatus.OK, content="{}", summary="1 order(s)", payload=result),
         state,
     )
 
     assert state.active_order_id == "ORD-2001"
+    assert state.active_item_id == "ITEM-900"
 
 
 def test_two_active_orders_are_not_guessed(make_agent) -> None:
     """CUST-003 has two live orders, so the agent is left with nothing to guess with.
 
-    Verification reports both ids and does not set `active_order_id`. The
-    account-scoped tools need one, so the only way forward is to ask — which the
+    The listing reports both ids and does not set `active_order_id`. The
+    order-specific tools need one, so the only way forward is to ask — which the
     model does here, in its own words. No `request_clarification` tool exists.
     """
     agent, client = make_agent(
         tool_call("verify_identity", {"email": "sofia@example.com"}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
         text("Thanks Sofia. I can see two active orders — ORD-1005 and ORD-1004. Which one?"),
     )
     state = SessionState()
@@ -852,38 +868,41 @@ def test_two_active_orders_are_not_guessed(make_agent) -> None:
 
     # The model was given both ids and no default — the clarification is grounded
     # in what the tool returned.
-    result = client.calls[1]["messages"][-1]["content"][0]
+    result = client.calls[2]["messages"][-1]["content"][0]
     assert "ORD-1004" in result["content"] and "ORD-1005" in result["content"]
 
 
-def test_verification_alone_is_enough_to_ask_which_order(make_agent) -> None:
-    """No order is read before the customer has chosen one.
+def test_one_listing_is_enough_to_ask_which_order(make_agent) -> None:
+    """No order is read in detail before the customer has chosen one.
 
-    The clarifying question needs the titles, not the orders. `verify_identity`
-    carries both ids and both books, so the turn that asks costs one tool call —
-    it used to cost three, because the agent read every live order to name them.
+    The clarifying question needs the titles, not the orders. One `lookup_order`
+    with no order id carries every id and every book, so the turn that asks costs
+    one call — it used to cost one per live order, because the agent read them all
+    to name them.
     """
     agent, client = make_agent(
         tool_call("verify_identity", {"email": "sofia@example.com"}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
         text("Two orders — one with Refactoring, one with Domain-Driven Design. Which one?"),
     )
     state = SessionState()
 
     agent.respond(state, "hi, it's sofia@example.com")
 
-    assert tool_names(state) == ["verify_identity"]
+    assert tool_names(state) == ["verify_identity", "lookup_order"]
 
-    # Everything the question needs came back from the one call that was made.
-    payload = json.loads(client.calls[1]["messages"][-1]["content"][0]["content"])
-    assert {order["order_id"] for order in payload["active_orders"]} == {"ORD-1004", "ORD-1005"}
-    assert all(order["items"] for order in payload["active_orders"])
+    # Everything the question needs came back from the one listing that was made.
+    payload = json.loads(client.calls[2]["messages"][-1]["content"][0]["content"])
+    assert {order["order_id"] for order in payload["orders"]} == {"ORD-1004", "ORD-1005"}
+    assert all(order["items"] for order in payload["orders"])
     assert state.active_order_id is None
 
 
 def test_only_the_chosen_order_is_looked_up(make_agent, seeded_graph) -> None:
-    """After the customer picks, exactly one order is read — theirs."""
+    """After the customer picks, exactly one order is read in detail — theirs."""
     agent, _ = make_agent(
         tool_call("verify_identity", {"email": "sofia@example.com"}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
         text("Two orders. Which one did you mean?"),
         tool_call("lookup_order", {"order_id": "ORD-1005"}, block_id="toolu_pick"),
         text("That one was delivered on the 6th."),
@@ -893,7 +912,7 @@ def test_only_the_chosen_order_is_looked_up(make_agent, seeded_graph) -> None:
     agent.respond(state, "hi, it's sofia@example.com")
     agent.respond(state, "the Refactoring one")
 
-    assert tool_names(state) == ["verify_identity", "lookup_order"]
+    assert tool_names(state) == ["verify_identity", "lookup_order", "lookup_order"]
     assert state.active_order_id == "ORD-1005"
 
 
@@ -1340,6 +1359,190 @@ def test_traces_hold_no_reasoning(make_agent) -> None:
 
 
 # =========================================================================
+# Clarify ambiguity, not certainty
+#
+# A customer who names their book has already chosen. The listing mode of
+# `lookup_order` is what turns that name into an order id and an item id, and
+# when it resolves to exactly one item there is nothing left to ask about and
+# nothing left to look up. When it resolves to several, there is.
+# =========================================================================
+
+
+BRUCE_EMAIL = "bruce@example.com"
+BRUCE_CUSTOMER = "CUST-002"
+EBOOK_ORDER, EBOOK_ITEM = "ORD-1003", "ITEM-201"
+"""Bruce's Clean Architecture — an ebook, so DIGITAL_NO_RETURN refuses it."""
+
+
+def test_a_uniquely_named_book_goes_straight_to_eligibility(make_agent, seeded_graph) -> None:
+    """"I want to return Clean Architecture" — verify, list, decide.
+
+    The title matches one item on one of Bruce's orders, so the listing has
+    already produced everything the check needs. No "shall I check that one?",
+    because he said which one; and no second `lookup_order` for the detail,
+    because nothing downstream asked for a date.
+    """
+    agent, _ = make_agent(
+        text("Happy to look. What's the email on your Bookly account?"),
+        tool_call("verify_identity", {"email": BRUCE_EMAIL}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
+        tool_call(
+            "check_return_eligibility",
+            {"order_id": EBOOK_ORDER, "item_id": EBOOK_ITEM},
+            block_id="toolu_elig",
+        ),
+        text("Clean Architecture is an ebook, and ebooks can't be returned once delivered."),
+    )
+    state = SessionState()
+
+    agent.respond(state, "I want to return Clean Architecture")
+    agent.respond(state, BRUCE_EMAIL)
+
+    assert tool_names(state) == ["verify_identity", "lookup_order", "check_return_eligibility"]
+    assert tool_names(state).count("lookup_order") == 1
+
+    assert state.eligibility is not None
+    assert state.eligibility.eligible is False
+    assert state.eligibility.policy_id == "DIGITAL_NO_RETURN"
+    assert state.pending_return is None
+
+
+def test_an_ambiguous_request_is_asked_about_before_anything_is_decided(
+    make_agent, seeded_graph
+) -> None:
+    """"One of my books" matches several, so the listing settles nothing.
+
+    The agent asks, and no eligibility check runs on a guess — `active_order_id`
+    is still None, which is what leaves it with nothing to guess *with*.
+    """
+    agent, _ = make_agent(
+        tool_call("verify_identity", {"email": BRUCE_EMAIL}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
+        text("You've got a few. Which one would you like to return?"),
+    )
+    state = SessionState()
+
+    reply = agent.respond(state, f"I want to return one of my books, it's {BRUCE_EMAIL}")
+
+    assert tool_names(state) == ["verify_identity", "lookup_order"]
+    assert "check_return_eligibility" not in tool_names(state)
+    assert "which one" in reply.lower()
+    assert state.active_order_id is None
+    assert state.active_item_id is None
+
+
+def test_the_listing_alone_cannot_reach_another_customers_order(make_agent) -> None:
+    """The customer id is injected from the session, so a verified Bruce sees
+    Bruce's orders however the model phrases the call."""
+    agent, client = make_agent(
+        tool_call("verify_identity", {"email": BRUCE_EMAIL}),
+        tool_call("lookup_order", {"customer_id": HERO_CUSTOMER}, block_id="toolu_list"),
+        text("Here's what I can see."),
+    )
+    state = SessionState()
+
+    agent.respond(state, f"what have I got on order? {BRUCE_EMAIL}")
+
+    listed = json.loads(client.calls[2]["messages"][-1]["content"][0]["content"])
+    assert {order["order_id"] for order in listed["orders"]} == {"ORD-1003", "ORD-1007"}
+    assert IN_WINDOW_ORDER not in client.calls[2]["messages"][-1]["content"][0]["content"]
+    assert state.tool_traces[-1].tool_args == {"customer_id": BRUCE_CUSTOMER}
+
+
+# =========================================================================
+# The operational log
+#
+# `LOG` is the file in `logs/bookly.log`, not the Agent Trace. It records what
+# ran and how it went, from the values the trace already sanitized — which is
+# what keeps a credential or a whole email address out of it.
+# =========================================================================
+
+
+def test_each_tool_call_is_logged_with_its_outcome_and_latency(
+    make_agent, seeded_graph, verified_state, caplog
+) -> None:
+    """The line an operator reads: which tool, whether it worked, how long, and
+    what the policy decided."""
+    agent, _ = make_agent(
+        tool_call(
+            "check_return_eligibility",
+            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
+        ),
+        text(CONFIRM_QUESTION),
+    )
+
+    with caplog.at_level("INFO", logger="bookly"):
+        agent.respond(verified_state, "can I return the paperback?")
+
+    logged = [record.getMessage() for record in caplog.records]
+    assert any(line.startswith("agent ") and "model=sonnet" in line for line in logged)
+
+    tool_line = next(line for line in logged if line.startswith("tool "))
+    assert "name=check_return_eligibility" in tool_line
+    assert "status=success" in tool_line
+    assert re.search(r"latency_ms=\d+\.\d", tool_line)
+    assert "policy=STANDARD_30_DAY eligible=true" in tool_line
+
+
+def test_a_refused_tool_is_logged_as_such(make_agent, caplog) -> None:
+    """"success" has to mean something, so a blocked call does not say it."""
+    agent, _ = make_agent(
+        tool_call("lookup_order", {"order_id": IN_WINDOW_ORDER}), text("What's your email?")
+    )
+
+    with caplog.at_level("INFO", logger="bookly"):
+        agent.respond(SessionState(), "where's my order?")
+
+    tool_line = next(line for line in caplog.messages if line.startswith("tool "))
+    assert "status=blocked" in tool_line
+    assert "status=success" not in tool_line
+
+
+def test_the_log_carries_no_secret_and_no_whole_email(
+    make_agent, seeded_graph, hero_script, data_dir, caplog
+) -> None:
+    """Same sanitization as the trace, because they are the same values.
+
+    The whole hero conversation, including the write: the address is masked, the
+    token is redacted, and nothing the model said is written down at all.
+    """
+    agent, _ = make_agent(*hero_script)
+
+    with caplog.at_level("INFO", logger="bookly"):
+        run_hero_flow(agent, SessionState())
+
+    logged = "\n".join(caplog.messages)
+    assert HERO_EMAIL not in logged
+    assert "a***@example.com" in logged
+    assert "'eligibility_token': '***'" in logged
+    assert "return_id=RET-" in logged
+    # The conversation itself is not operational data.
+    assert "Where's my book?" not in logged
+    assert CONFIRM_QUESTION not in logged
+
+
+def test_a_broken_log_handler_does_not_break_the_turn(make_agent, caplog) -> None:
+    """Logging is an observation of the work, never a condition of it."""
+
+    class ExplodingHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            raise OSError("no space left on device")
+
+    handler = ExplodingHandler()
+    LOG.addHandler(handler)
+    try:
+        agent, _ = make_agent(
+            tool_call("verify_identity", {"email": HERO_EMAIL}), text("Found you.")
+        )
+        state = SessionState()
+
+        assert agent.respond(state, HERO_EMAIL) == "Found you."
+        assert state.verified_customer_id == HERO_CUSTOMER
+    finally:
+        LOG.removeHandler(handler)
+
+
+# =========================================================================
 # The hero journey, end to end
 #
 #     order status → verify → clarify between two orders → look one up
@@ -1363,7 +1566,8 @@ def test_hero_flow_end_to_end(make_agent, seeded_graph, hero_script, data_dir) -
 
     assert tool_names(state) == [
         "verify_identity",
-        "lookup_order",
+        "lookup_order",  # discovery: two orders, so the agent has to ask
+        "lookup_order",  # the one she chose, in detail
         "check_return_eligibility",
         "initiate_return",
     ]

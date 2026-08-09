@@ -766,6 +766,30 @@ def test_sessions_are_still_opened_independently(recorded_driver) -> None:
     assert recorded_driver.sessions == 2
 
 
+def test_warming_uses_the_shared_driver_and_reads_nothing_else(recorded_driver) -> None:
+    """Startup pays the handshake once so the first customer question does not.
+
+    One driver for the warm-up and the policy read after it, and the warm-up query
+    is a bare `RETURN 1` — it must not touch, let alone change, the graph.
+    """
+    graph.warm_graph()
+    graph.fetch_policies_for_category("PhysicalBook")
+
+    assert len(recorded_driver.built) == 1
+    assert graph.get_driver() is recorded_driver
+    assert recorded_driver.queries[0].strip() == "RETURN 1"
+    assert not any(
+        word in " ".join(recorded_driver.queries).upper()
+        for word in ("CREATE", "MERGE", "DELETE", "SET ")
+    )
+
+
+def test_a_failed_warm_up_raises_rather_than_pretending(unconfigured) -> None:
+    """The caller decides what to do about it — `app.py` shrugs, a tool does not."""
+    with pytest.raises(graph.PolicyGraphUnavailableError):
+        graph.warm_graph()
+
+
 def test_closing_the_driver_lets_the_next_call_open_a_fresh_one(recorded_driver) -> None:
     """For shutdown, and for a test that wants a clean slate. Idempotent."""
     graph.get_driver()

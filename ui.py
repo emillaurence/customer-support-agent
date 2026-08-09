@@ -25,7 +25,6 @@ import streamlit as st
 from pydantic import BaseModel, Field
 
 from agent.state import (
-    EligibilityDecision,
     Message,
     Role,
     SessionState,
@@ -167,9 +166,6 @@ class AssistantTurn(BaseModel):
     tool_traces: list[ToolTrace] = Field(
         default_factory=list, description="The tools this turn ran, in execution order."
     )
-    eligibility: EligibilityDecision | None = Field(
-        default=None, description="The decision behind this turn's eligibility check."
-    )
 
     @property
     def tool_names(self) -> list[str]:
@@ -184,39 +180,13 @@ def capture_turn(state: SessionState, reply: str, *, trace_offset: int) -> Assis
     the loop only ever appends.
     """
     turn = state.model_turns[-1] if state.model_turns else None
-    traces = list(state.tool_traces[trace_offset:])
     return AssistantTurn(
         reply=reply,
         model=turn.model if turn else "",
         model_tier=turn.model_tier if turn else "",
         routing_reason=turn.routing_reason if turn else "",
-        tool_traces=traces,
-        eligibility=eligibility_for(state, traces),
+        tool_traces=list(state.tool_traces[trace_offset:]),
     )
-
-
-def eligibility_for(state: SessionState, traces: list[ToolTrace]) -> EligibilityDecision | None:
-    """The decision belonging to this turn's eligibility check, if there is one.
-
-    A `ToolTrace` records the call, not the policy behind it, so the decision is
-    read off `state.eligibility` — and matched against the call's own order and
-    item, because a decision shown against the wrong turn is worse than none. A
-    decision cleared since (by a return opening later in the turn) is not shown.
-    """
-    checks = [
-        trace
-        for trace in traces
-        if trace.tool_name == "check_return_eligibility" and trace.status is ToolStatus.OK
-    ]
-    if not checks or state.eligibility is None:
-        return None
-
-    args = checks[-1].tool_args
-    if args.get("order_id") != state.active_order_id:
-        return None
-    if args.get("item_id") != state.active_item_id:
-        return None
-    return state.eligibility
 
 
 def pair_turns(
@@ -471,10 +441,10 @@ def render_trace(turn: AssistantTurn) -> None:
         st.markdown(f"**Model** · {tier_label(turn.model_tier)} · `{turn.model or '—'}`")
         st.caption(f"Routing · {turn.routing_reason or '—'}")
         for position, trace in enumerate(turn.tool_traces, start=1):
-            render_tool_trace(trace, turn, position=position)
+            render_tool_trace(trace, position=position)
 
 
-def render_tool_trace(trace: ToolTrace, turn: AssistantTurn, *, position: int) -> None:
+def render_tool_trace(trace: ToolTrace, *, position: int) -> None:
     """One tool call: what was asked, what came back, and how long it took.
 
     Two lines rather than a card — a scannable headline and a caption — so a turn
@@ -493,11 +463,13 @@ def render_tool_trace(trace: ToolTrace, turn: AssistantTurn, *, position: int) -
     if trace.error:
         st.caption(f"Detail · {trace.error}")
 
-    if turn.eligibility is not None and trace.tool_name == "check_return_eligibility":
-        render_policy_decision(turn.eligibility)
+    # Read off this call, not off the session: a turn that checks two items holds
+    # only the last decision in state, and the first check must still show its own.
+    if trace.policy_decision:
+        render_policy_decision(trace.policy_decision)
 
 
-def render_policy_decision(decision: EligibilityDecision) -> None:
+def render_policy_decision(decision: dict[str, Any]) -> None:
     """The graph-backed part of an eligibility check: policy, decision, path.
 
     Showing the path is what distinguishes an *evaluated* answer from a guessed
@@ -505,10 +477,10 @@ def render_policy_decision(decision: EligibilityDecision) -> None:
     an implementation detail.
     """
     st.markdown(
-        f"**Policy** · {decision.policy_id or '—'} "
-        f"· **Decision** · {decision_label(decision.eligible)}"
+        f"**Policy** · {decision.get('policy_id') or '—'} "
+        f"· **Decision** · {decision_label(bool(decision.get('eligible')))}"
     )
-    if path := format_rule_path(decision.rule_path):
+    if path := format_rule_path(decision.get("rule_path") or []):
         st.caption("Rule path")
         st.markdown(f'<div class="bookly-path">{path}</div>', unsafe_allow_html=True)
 

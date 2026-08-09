@@ -87,6 +87,19 @@ def get_driver() -> Driver:
     return _driver
 
 
+def warm_graph() -> None:
+    """Open the shared driver and take one connection through a trivial read.
+
+    Called once at startup so the first *customer* policy question does not pay
+    for the driver, the handshake, and a cold pool on top of its own query.
+    Read-only by construction: it must not change what the graph would answer.
+
+    Raises:
+        PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
+    """
+    get_driver().execute_query("RETURN 1")
+
+
 def close_driver() -> None:
     """Close the shared driver and drop it, so the next call opens a fresh one.
 

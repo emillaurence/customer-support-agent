@@ -97,6 +97,32 @@ def clean_tokens():
     _clear_eligibility_tokens()
 
 
+@pytest.fixture(autouse=True)
+def log_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point the operational log at a throwaway file, and take any handler away
+    again afterwards.
+
+    Autouse for the same reason as `data_dir`: the shell writes to
+    `logs/bookly.log` beside the code, and a test run must neither append to the
+    file a demo is being read from nor leave a handler behind for the next test.
+    Set through the environment, not a patched attribute — `AppTest` re-execs
+    `app.py` in its own namespace, which only the environment reaches.
+    """
+    from agent.agent import LOG
+
+    monkeypatch.setenv("BOOKLY_LOG_FILE", str(tmp_path / "logs" / "bookly.log"))
+    before = list(LOG.handlers)
+    yield
+    for handler in LOG.handlers:
+        if handler not in before:
+            handler.close()
+    LOG.handlers = before
+
+    import app
+
+    app.setup_logging.clear()
+
+
 def returns_in(data_dir: Path) -> list[dict]:
     """Every RMA currently on disk, read from the test's temporary data copy."""
     return json.loads((data_dir / "returns.json").read_text())
@@ -352,9 +378,10 @@ def hero_script():
     return (
         # Turn 1 — unverified, so the only thing to do is ask.
         text("Happy to check. What's the email address on your Bookly account?"),
-        # Turn 2 — verify, and ask straight away. `verify_identity` already names
-        # both orders and the books on them, so there is nothing to look up yet.
+        # Turn 2 — verify, then list the orders. Ada has two and has named
+        # neither, so the list is what the clarifying question is built from.
         tool_call("verify_identity", {"email": HERO_EMAIL}),
+        tool_call("lookup_order", {}, block_id="toolu_list"),
         text(
             "Thanks Ada. You've got two orders with us — one with The Pragmatic "
             "Programmer and one with Designing Data-Intensive Applications. Which "

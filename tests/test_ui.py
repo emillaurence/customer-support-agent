@@ -17,10 +17,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import ui
-from agent.agent import AnthropicConfigError
+from agent.agent import AnthropicConfigError, _policy_decision
 from agent.state import (
     EligibilityDecision,
     ModelTurn,
@@ -33,6 +34,7 @@ from agent.state import (
     summarize,
 )
 from agent.tools import _create_eligibility_token, _GRANTS, reset_demo
+from policy.graph import PolicyGraphUnavailableError
 from tests.conftest import (
     EXPIRED_ITEM,
     EXPIRED_ORDER,
@@ -44,6 +46,7 @@ from tests.conftest import (
     run_hero_flow,
     text,
     tool_call,
+    tool_calls,
 )
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -410,64 +413,35 @@ def test_a_blocked_write_is_visible_on_the_turn() -> None:
 # --- The eligibility decision beside its check ---------------------------
 
 
-def eligible_state() -> SessionState:
-    """A session holding a decision for the hero order and item."""
-    return SessionState(
-        verified_customer_id=HERO_CUSTOMER,
-        active_order_id=IN_WINDOW_ORDER,
-        active_item_id=IN_WINDOW_ITEM,
-        eligibility=EligibilityDecision(
+def test_a_decision_travels_on_the_call_that_made_it() -> None:
+    """The renderable decision is on the trace, so the tool call explains itself."""
+    decision = _policy_decision(
+        EligibilityDecision(
             eligible=True,
             policy_id="STANDARD_30_DAY",
             explanation="Inside the window.",
             rule_path=STANDARD_PATH,
-        ),
+            eligibility_token="elig-secret",
+            days_remaining=12,
+        )
     )
 
-
-def eligibility_trace(order_id: str = IN_WINDOW_ORDER, item_id: str = IN_WINDOW_ITEM) -> ToolTrace:
-    return trace(
-        tool_name="check_return_eligibility",
-        tool_args={"order_id": order_id, "item_id": item_id},
-        result_summary="eligible=True, policy_id=STANDARD_30_DAY",
-    )
-
-
-def test_the_decision_is_shown_against_the_check_that_made_it() -> None:
-    decision = ui.eligibility_for(eligible_state(), [eligibility_trace()])
-
-    assert decision is not None
-    assert decision.policy_id == "STANDARD_30_DAY"
-    assert ui.format_rule_path(decision.rule_path) == "PhysicalBook → STANDARD_30_DAY"
+    assert decision == {
+        "eligible": True,
+        "policy_id": "STANDARD_30_DAY",
+        "rule_path": STANDARD_PATH,
+        "days_remaining": 12,
+    }
+    # The token is a credential, and the explanation is already the reply.
+    assert "eligibility_token" not in decision
+    assert "explanation" not in decision
 
 
-def test_a_turn_without_a_check_gets_no_decision() -> None:
-    """A held decision is not attached to a turn that did not check anything."""
-    assert ui.eligibility_for(eligible_state(), [trace(tool_name="lookup_order")]) is None
-
-
-def test_a_decision_for_another_item_is_not_shown() -> None:
-    """A path shown against the wrong item is worse than no path at all.
-
-    The session holds one decision at a time. If the customer switched item, the
-    check in an older turn is not what the session now holds.
-    """
-    stale = eligibility_trace(order_id=EXPIRED_ORDER, item_id=EXPIRED_ITEM)
-    assert ui.eligibility_for(eligible_state(), [stale]) is None
-
-
-def test_a_failed_check_carries_no_decision() -> None:
-    """Nothing can be concluded from a check that did not run."""
-    broken = eligibility_trace()
-    broken.status = ToolStatus.ERROR
-    assert ui.eligibility_for(eligible_state(), [broken]) is None
-
-
-def test_a_cleared_decision_is_not_borrowed() -> None:
-    """After the write clears the return context there is nothing to display."""
-    state = eligible_state()
-    state.clear_return_context()
-    assert ui.eligibility_for(state, [eligibility_trace()]) is None
+def test_a_call_that_is_not_an_eligibility_check_carries_no_decision() -> None:
+    """Every other tool leaves the field empty, so nothing borrows a policy."""
+    assert _policy_decision(None) is None
+    assert _policy_decision("ORD-1001 · 2 items") is None
+    assert trace(tool_name="lookup_order").policy_decision is None
 
 
 # --- Pairing the transcript with the traces ------------------------------
@@ -552,7 +526,7 @@ def test_the_hero_flow_traces_line_up_with_the_replies(make_agent, seeded_graph,
 
     assert [turn.tool_names for turn in turns] == [
         [],
-        ["verify_identity"],
+        ["verify_identity", "lookup_order"],
         ["lookup_order"],
         ["check_return_eligibility"],
         ["initiate_return"],
@@ -570,15 +544,13 @@ def test_the_eligibility_turn_shows_the_policy_and_the_path(
 
     turns = capture_flow(agent, state, *HERO_PROMPTS[:4])
 
-    eligibility_turn = turns[-1]
-    assert eligibility_turn.eligibility is not None
-    assert eligibility_turn.eligibility.policy_id == "STANDARD_30_DAY"
-    assert eligibility_turn.eligibility.eligible is True
-    assert ui.format_rule_path(eligibility_turn.eligibility.rule_path) == (
-        "PhysicalBook → STANDARD_30_DAY"
-    )
+    decision = turns[-1].tool_traces[0].policy_decision
+    assert decision is not None
+    assert decision["policy_id"] == "STANDARD_30_DAY"
+    assert decision["eligible"] is True
+    assert ui.format_rule_path(decision["rule_path"]) == "PhysicalBook → STANDARD_30_DAY"
     # The earlier turns explain nothing about policy, and must not claim to.
-    assert all(turn.eligibility is None for turn in turns[:-1])
+    assert all(t.policy_decision is None for turn in turns[:-1] for t in turn.tool_traces)
 
 
 def test_the_hero_flow_display_shows_no_email_and_no_token(
@@ -613,10 +585,44 @@ def test_the_outside_window_turn_shows_a_refusal_with_its_policy(
 
     assert turn.model_tier == "sonnet"
     assert turn.tool_names == ["check_return_eligibility"]
-    assert turn.eligibility is not None
-    assert ui.decision_label(turn.eligibility.eligible) == "Not eligible"
-    assert turn.eligibility.policy_id == "STANDARD_30_DAY"
-    assert ui.format_rule_path(turn.eligibility.rule_path) == "PhysicalBook → STANDARD_30_DAY"
+    decision = turn.tool_traces[0].policy_decision
+    assert decision is not None
+    assert ui.decision_label(decision["eligible"]) == "Not eligible"
+    assert decision["policy_id"] == "STANDARD_30_DAY"
+    assert ui.format_rule_path(decision["rule_path"]) == "PhysicalBook → STANDARD_30_DAY"
+
+
+def test_two_checks_in_one_turn_keep_their_own_decisions(make_agent, seeded_graph) -> None:
+    """The regression: one turn, two items, two different policies.
+
+    The session only ever holds the *last* decision, so a trace that read it would
+    show the ebook's refusal against the physical book's check.
+    """
+    agent, _ = make_agent(
+        tool_calls(
+            ("check_return_eligibility", {"order_id": "ORD-1003", "item_id": "ITEM-102"}),
+            ("check_return_eligibility", {"order_id": "ORD-1003", "item_id": "ITEM-201"}),
+        ),
+        text("The paperback can go back; the ebook can't."),
+    )
+    state = SessionState(
+        verified_customer_id="CUST-002", customer_region="AU", active_order_ids=["ORD-1003"]
+    )
+
+    book, ebook = capture_flow(agent, state, "Which one am I eligible for?")[0].tool_traces
+
+    assert book.policy_decision["policy_id"] == "AU_BOOKLY_EXTENDED_RETURN"
+    assert ui.decision_label(book.policy_decision["eligible"]) == "Eligible"
+    assert ui.format_rule_path(book.policy_decision["rule_path"]).startswith(
+        "PhysicalBook → AU_BOOKLY_EXTENDED_RETURN"
+    )
+
+    assert ebook.policy_decision["policy_id"] == "DIGITAL_NO_RETURN"
+    assert ui.decision_label(ebook.policy_decision["eligible"]) == "Not eligible"
+    assert ui.format_rule_path(ebook.policy_decision["rule_path"]) == "EBook → DIGITAL_NO_RETURN"
+
+    # The turn-level decision is the ebook's, and it did not overwrite the first.
+    assert state.eligibility.policy_id == "DIGITAL_NO_RETURN"
 
 
 def test_an_anthropic_outage_is_traced_and_answered(make_agent) -> None:
@@ -916,6 +922,45 @@ def test_a_missing_anthropic_configuration_is_an_explanation_not_a_crash(
     assert not at.chat_input
 
 
+def test_neo4j_is_warmed_once_however_often_the_script_reruns(app, monkeypatch) -> None:
+    """Streamlit reruns the whole script per interaction; the pool is warmed once.
+
+    Read at the driver, so this also asserts the warm-up and the policy tools go
+    through the same shared driver rather than a second one.
+    """
+    queries: list[str] = []
+
+    class WarmDriver:
+        def execute_query(self, query: str, **_: Any):
+            queries.append(query)
+            return [], None, None
+
+    monkeypatch.setattr("policy.graph.get_driver", WarmDriver)
+    st.cache_resource.clear()
+
+    at = app(text("Hello!"), text("Still here."))
+    say(at, "Where's my book?")
+    say(at, "Thanks!")
+
+    assert queries == ["RETURN 1"]
+
+
+def test_the_shell_still_opens_when_neo4j_is_down(app, monkeypatch) -> None:
+    """Best-effort: a cold database costs a slow first query, not a broken page."""
+
+    def refuse() -> None:
+        raise PolicyGraphUnavailableError("cannot reach Neo4j at bolt://nowhere")
+
+    monkeypatch.setattr("policy.graph.get_driver", refuse)
+    st.cache_resource.clear()
+
+    at = app(text("Hello!"))
+
+    assert not at.exception
+    assert at.chat_input
+    assert "Neo4j" not in page_text(at)
+
+
 def test_a_reply_carries_its_own_trace(app) -> None:
     """The tool that ran appears under the reply that used it, with a latency."""
     at = app(
@@ -990,7 +1035,8 @@ def test_the_hero_flow_renders_a_trace_per_acting_turn(app, hero_script, data_di
     assert len(traces(at)) == 4
     assert [t.tool_name for t in at.session_state["bookly_state"].tool_traces] == [
         "verify_identity",
-        "lookup_order",
+        "lookup_order",  # discovery: which orders are there to choose between
+        "lookup_order",  # the one she chose, in detail
         "check_return_eligibility",
         "initiate_return",
     ]
@@ -1022,12 +1068,13 @@ def test_the_eligibility_trace_shows_the_policy_and_the_graph_path(app, hero_scr
 
 
 def test_the_traces_stay_attached_to_the_right_replies(app, hero_script) -> None:
-    """Turn two verified and asked; turn three read the order they picked."""
+    """Turn two verified and listed her orders to ask which; turn three read the
+    one she picked."""
     at = run_hero_flow_in_ui(app(*hero_script))
 
     shown = [body(block) for block in traces(at)]
     assert "verify_identity" in shown[0]
-    assert shown[0].count("lookup_order") == 0
+    assert shown[0].count("lookup_order") == 1
     assert shown[1].count("lookup_order") == 1
     assert "check_return_eligibility" in shown[2]
     assert "initiate_return" in shown[3]
@@ -1149,11 +1196,58 @@ def test_the_hero_flow_can_be_run_twice_through_the_ui(
     assert at.session_state["bookly_state"].tool_traces[-1].tool_name == "initiate_return"
 
 
+def test_the_shell_opens_a_rotating_log_file(monkeypatch) -> None:
+    """`logs/bookly.log`, created on the way up if it is not there.
+
+    Rotation is the stdlib's, at a megabyte and three backups, so a long-running
+    demo cannot fill a disk and nothing here implements a rotation scheme. The
+    `log_file` fixture already pointed `BOOKLY_LOG_FILE` at a throwaway path;
+    reimporting picks it up, since `LOG_FILE` is read once at module load.
+    """
+    import importlib
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    import app
+
+    app = importlib.reload(app)
+    app.setup_logging()
+    app.LOG.info("tool name=verify_identity status=success latency_ms=1.2")
+
+    assert app.LOG_FILE.exists()
+    written = app.LOG_FILE.read_text()
+    assert "INFO tool name=verify_identity status=success latency_ms=1.2" in written
+
+    handler = next(h for h in app.LOG.handlers if isinstance(h, RotatingFileHandler))
+    assert (handler.maxBytes, handler.backupCount) == (1_000_000, 3)
+    assert app.LOG.level == logging.INFO
+
+
+def test_an_unwritable_log_file_does_not_stop_the_app(tmp_path, monkeypatch) -> None:
+    """A log nobody can write is a log nobody gets, not a shell that will not
+    start."""
+    import importlib
+
+    import app
+
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("")
+    monkeypatch.setenv("BOOKLY_LOG_FILE", str(blocked / "logs" / "bookly.log"))
+
+    app = importlib.reload(app)
+    handlers_before = list(app.LOG.handlers)
+    app.setup_logging()  # raises nothing
+
+    assert app.LOG.handlers == handlers_before
+
+
 def test_the_ui_reset_holds_no_reset_logic_of_its_own() -> None:
     """`app.py` restores nothing itself — it calls the shared implementation."""
     source = Path(APP).read_text()
     assert "from agent.tools import reset_demo" in source
-    assert not _imported_modules(source) & {"json", "shutil", "os", "pathlib"}
+    # No reading, copying, or deleting of the demo data here. `os` and `pathlib`
+    # are allowed: they only place the log file, and neither restores anything.
+    assert not _imported_modules(source) & {"json", "shutil"}
 
 
 def test_the_ui_layer_holds_no_business_logic() -> None:

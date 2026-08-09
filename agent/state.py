@@ -156,6 +156,14 @@ class ToolTrace(BaseModel):
     latency_ms: float
     result_summary: str = ""
     error: str | None = Field(default=None, description="The message, never a stack.")
+    policy_decision: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "For an eligibility check: what *this* call decided. Held per invocation "
+            "because one turn can check several items, and the session only keeps the "
+            "last decision. Rendering fields only — never the eligibility token."
+        ),
+    )
 
 
 class ModelTurn(BaseModel):

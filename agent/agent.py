@@ -20,6 +20,7 @@ customer as what it was.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime
@@ -31,6 +32,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 from agent.state import (
+    EligibilityDecision,
     ModelTurn,
     Role,
     SessionState,
@@ -38,7 +40,23 @@ from agent.state import (
     ToolTrace,
     sanitize_args,
 )
-from agent.tools import TOOL_SCHEMAS, apply_tool_result, invoke_tool
+from agent.tools import (
+    TOOL_SCHEMAS,
+    EscalationResult,
+    ReturnResult,
+    apply_tool_result,
+    invoke_tool,
+)
+
+LOG = logging.getLogger("bookly")
+"""Operational logging: what ran, whether it worked, how long it took.
+
+Given a handler by `app.py` — the library only writes records, so a test or a
+script that never configures logging pays nothing and cannot be broken by it.
+The lines are written from the same sanitized values as the Agent Trace, so a
+credential or a whole email address cannot reach the file by this route either.
+No prompt, no reply, no reasoning: those are the conversation, not operations.
+"""
 
 # --- Configuration -------------------------------------------------------
 #
@@ -152,12 +170,18 @@ Anything account-specific needs a verified customer: ask for the email on their
 Bookly account and call `verify_identity`. Share no account details until it
 succeeds.
 
-## Ask rather than assume
-`verify_identity` names their active orders and the books on each. If there is
-more than one, name the books and ask which they mean — never pick the recent or
-likely one, and do not look orders up to choose between them. Once they have
-chosen, `lookup_order` on that one. If an order has several items, ask which
-they want to return. One question at a time.
+## Find the order, then ask only if it is still unclear
+Once identity is settled, call `lookup_order` with no order id: it lists their
+orders with the books on each and the item ids to act on. If what the customer
+named matches exactly one item, that is the one — use its order id and item id
+straight away. Do not ask them to confirm a choice they already made, and do not
+look the order up again for detail you were not asked for.
+
+Ask when it is genuinely ambiguous: the title matches items on two orders, they
+said "my book" and several could be it, or they have not named one at all. Then
+name the books and ask which — never pick the recent or likely one. One question
+at a time. Read a single order with `lookup_order` when the customer wants its
+dates, delivery, or status.
 
 ## Confirm before acting
 A return changes Bookly's records. Before opening one, name the item and the
@@ -542,6 +566,12 @@ class BooklyAgent:
             routing_reason=decision.reason,
         )
         state.model_turns.append(turn)
+        LOG.info(
+            'agent session=%s model=%s route="%s"',
+            state.session_id,
+            decision.tier.value,
+            decision.reason,
+        )
 
         # The loop owns `state.transcript` — every assistant turn it produces,
         # including a fallback, is written there by the loop itself. Here we only
@@ -589,6 +619,7 @@ class BooklyAgent:
                     # carries the transcript, and the key lives on the client.
                     error=f"{type(exc).__name__}: {exc}",
                 )
+                LOG.error("model call=failed error=%s", type(exc).__name__)
                 state.transcript.append(_assistant_text(FALLBACK_UNAVAILABLE))
                 return FALLBACK_UNAVAILABLE
 
@@ -641,18 +672,30 @@ class BooklyAgent:
         if outcome.status is ToolStatus.OK:
             apply_tool_result(name, args, outcome, state, adopt_active_order=adopt_active_order)
 
+        # The arguments as they were actually used — trusted values included, so
+        # the trace shows the real call — with anything sensitive masked. The log
+        # line below reads the same values, rather than sanitizing them twice.
+        traced_args = sanitize_args(outcome.args_used or args)
+
         self._trace(
             state,
             decision,
             model_id,
             tool_name=name or "<unnamed>",
-            # The arguments as they were actually used — trusted values included,
-            # so the trace shows the real call — with anything sensitive masked.
-            tool_args=sanitize_args(outcome.args_used or args),
+            tool_args=traced_args,
             status=outcome.status,
             latency_ms=round(latency_ms, 2),
             summary=outcome.summary,
             error=outcome.error,
+            policy_decision=_policy_decision(outcome.payload),
+        )
+        LOG.info(
+            "tool name=%s status=%s latency_ms=%.1f args=%s%s",
+            name or "<unnamed>",
+            "success" if outcome.status is ToolStatus.OK else outcome.status.value,
+            latency_ms,
+            traced_args,
+            _log_facts(outcome.payload),
         )
 
         return {
@@ -701,6 +744,7 @@ class BooklyAgent:
         latency_ms: float,
         summary: str,
         error: str | None,
+        policy_decision: dict[str, Any] | None = None,
     ) -> None:
         """Record one observable event on the session.
 
@@ -718,8 +762,44 @@ class BooklyAgent:
                 latency_ms=latency_ms,
                 result_summary=summary,
                 error=error,
+                policy_decision=policy_decision,
             )
         )
+
+
+def _log_facts(payload: Any) -> str:
+    """The outcome worth having in the log for this tool, as ` key=value` pairs.
+
+    The three results an operator looks for after the fact: what a policy decided,
+    which RMA was opened, which case was raised. Read off the same payload the
+    trace uses, and never the token on it.
+    """
+    if isinstance(payload, EligibilityDecision):
+        return f" policy={payload.policy_id} eligible={str(payload.eligible).lower()}"
+    if isinstance(payload, ReturnResult):
+        return (
+            f" return_id={payload.return_record.return_id} "
+            f"created={str(payload.created).lower()}"
+        )
+    if isinstance(payload, EscalationResult):
+        return f" case_id={payload.case_id}"
+    return ""
+
+
+def _policy_decision(payload: Any) -> dict[str, Any] | None:
+    """The renderable part of one eligibility decision, or None for any other tool.
+
+    Taken from the payload of *this* call, so a turn that checks two items shows
+    each item's own policy. The token is deliberately left behind.
+    """
+    if not isinstance(payload, EligibilityDecision):
+        return None
+    return {
+        "eligible": payload.eligible,
+        "policy_id": payload.policy_id,
+        "rule_path": payload.rule_path,
+        "days_remaining": payload.days_remaining,
+    }
 
 
 # --- Reading an Anthropic response ---------------------------------------

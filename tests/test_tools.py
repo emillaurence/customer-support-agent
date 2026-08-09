@@ -63,11 +63,10 @@ def test_known_email_verifies() -> None:
     assert result.region == "GB"
 
 
-def test_result_carries_customer_region_and_active_orders() -> None:
-    """The three things the agent needs to carry forward, and nothing else."""
+def test_result_carries_customer_and_region() -> None:
+    """The two things the agent needs to carry forward, plus a name to use."""
     result = verify_identity("bruce@example.com")
-    assert (result.customer_id, result.region) == ("CUST-002", "AU")
-    assert set(result.active_order_ids) == {"ORD-1003", "ORD-1007"}
+    assert (result.customer_id, result.name, result.region) == ("CUST-002", "Bruce", "AU")
 
 
 def test_unknown_email_is_rejected() -> None:
@@ -75,7 +74,6 @@ def test_unknown_email_is_rejected() -> None:
     assert result.verified is False
     assert result.customer_id is None
     assert result.region is None
-    assert result.active_order_ids == []
 
 
 @pytest.mark.parametrize("email", ["", "   ", "ada@", "ada"])
@@ -93,26 +91,17 @@ def test_email_match_ignores_case_and_whitespace() -> None:
     assert result.customer_id == HERO_CUSTOMER
 
 
-def test_verification_exposes_no_order_detail() -> None:
-    """Enough to ask which order, and no more.
+def test_verify_identity_answers_only_the_identity_question() -> None:
+    """Who they are and which region's rules apply. Nothing about their orders.
 
-    Ids, titles, and the status the customer can already see. Dates, prices, line
-    items, and promotions are lookup_order's to give out — and only for the order
-    they actually choose.
+    Order ids, titles, statuses, dates, prices, and promotions are lookup_order's
+    to give out — verification that also listed orders was two tools under one
+    name, and neither question could be asked on its own.
     """
     dumped = verify_identity("ada@example.com").model_dump()
-    assert set(dumped) == {"verified", "customer_id", "region", "active_orders", "message"}
-    assert [order["order_id"] for order in dumped["active_orders"]] == ["ORD-1001", "ORD-1002"]
-    assert set(dumped["active_orders"][0]) == {"order_id", "status", "items"}
 
-
-def test_verification_names_the_books_on_each_order() -> None:
-    """The titles are what makes "which one?" answerable — a customer knows the
-    book they bought, not the order number."""
-    orders = {order.order_id: order for order in verify_identity("ada@example.com").active_orders}
-
-    assert orders["ORD-1001"].items == ["The Pragmatic Programmer"]
-    assert orders["ORD-1002"].items == ["Designing Data-Intensive Applications"]
+    assert set(dumped) == {"verified", "customer_id", "name", "region", "message"}
+    assert "ORD-" not in json.dumps(dumped)
 
 
 def test_rejection_does_not_say_whether_the_address_is_known() -> None:
@@ -120,13 +109,6 @@ def test_rejection_does_not_say_whether_the_address_is_known() -> None:
     message = verify_identity("nobody@example.com").message.lower()
     assert "cust-" not in message
     assert "ord-" not in message
-
-
-def test_customer_with_two_active_orders_gets_both() -> None:
-    """CUST-003 has ORD-1004 and ORD-1005. The tool hands back both so the agent
-    can ask which — it can only ask if it was given the choice."""
-    result = verify_identity("sofia@example.com")
-    assert set(result.active_order_ids) == {"ORD-1004", "ORD-1005"}
 
 
 def test_active_orders_are_newest_first() -> None:
@@ -144,11 +126,64 @@ def test_every_fixture_customer_has_more_than_one_active_order() -> None:
         assert len(active_order_ids(customer_id)) > 1
 
 
-# --- lookup_order -------------------------------------------------------
+# --- lookup_order: discovery --------------------------------------------
+#
+# One tool, two modes. Without an order id it lists what the customer has, which
+# is how a title becomes an order id and an item id; with one it reads that order
+# in full. Ownership is enforced the same way in both.
+
+
+def test_lookup_order_lists_the_customers_orders() -> None:
+    """Bruce's two orders, newest first, with the books on each."""
+    result = lookup_order("CUST-002")
+
+    assert [order.order_id for order in result.orders] == ["ORD-1007", "ORD-1003"]
+    assert [item.title for item in result.orders[1].items] == [
+        "A Short History of Nearly Everything",
+        "Clean Architecture (ebook)",
+    ]
+
+
+def test_listed_orders_carry_the_item_ids_needed_to_act() -> None:
+    """The point of the list mode: a title the customer named resolves to an
+    order and an item without a second lookup."""
+    result = lookup_order("CUST-002")
+
+    match = [
+        (order.order_id, item.item_id)
+        for order in result.orders
+        for item in order.items
+        if item.title.startswith("Clean Architecture")
+    ]
+    assert match == [("ORD-1003", "ITEM-201")]
+
+
+def test_listed_orders_carry_no_order_detail() -> None:
+    """Enough to find the right order, and no more: dates, prices, quantities,
+    and promotions belong to the detailed mode."""
+    dumped = lookup_order("CUST-002").model_dump()
+
+    assert set(dumped["orders"][0]) == {"order_id", "status", "items"}
+    assert set(dumped["orders"][0]["items"][0]) == {"item_id", "title", "product_type"}
+
+
+def test_listing_someone_elses_orders_is_impossible() -> None:
+    """The list is built from the customer id, so there is nothing to spoof."""
+    listed = {order.order_id for order in lookup_order(HERO_CUSTOMER).orders}
+
+    assert listed == {IN_WINDOW_ORDER, "ORD-1002"}
+    assert "ORD-1003" not in listed  # Bruce's
+
+
+def test_listing_an_unknown_customer_is_empty_not_an_error() -> None:
+    assert lookup_order("CUST-999").orders == []
+
+
+# --- lookup_order: one order --------------------------------------------
 
 
 def test_lookup_order_returns_items(now: datetime) -> None:
-    details = lookup_order("ORD-1003", "CUST-002", now=now)
+    details = lookup_order("CUST-002", "ORD-1003", now=now)
     assert details is not None
     assert [item.item_id for item in details.items] == ["ITEM-102", "ITEM-201"]
     assert details.items[0].title == "A Short History of Nearly Everything"
@@ -156,30 +191,33 @@ def test_lookup_order_returns_items(now: datetime) -> None:
 
 def test_lookup_order_unknown_id_returns_none(now: datetime) -> None:
     """An order number that does not exist yields None, not an error."""
-    assert lookup_order("ORD-9999", HERO_CUSTOMER, now=now) is None
+    assert lookup_order(HERO_CUSTOMER, "ORD-9999", now=now) is None
 
 
 def test_lookup_order_rejects_other_customers_order(now: datetime) -> None:
     """ORD-1008 is CUST-004's. CUST-001 quoting the real number gets nothing."""
-    assert lookup_order("ORD-1008", HERO_CUSTOMER, now=now) is None
+    assert lookup_order(HERO_CUSTOMER, "ORD-1008", now=now) is None
 
 
 def test_missing_and_forbidden_orders_are_indistinguishable(now: datetime) -> None:
     """Same answer either way, so a response cannot confirm an order id is real."""
-    assert lookup_order("ORD-1008", HERO_CUSTOMER, now=now) == lookup_order(
-        "ORD-9999", HERO_CUSTOMER, now=now
+    assert lookup_order(HERO_CUSTOMER, "ORD-1008", now=now) == lookup_order(
+        HERO_CUSTOMER, "ORD-9999", now=now
     )
 
 
 def test_order_details_need_a_customer_id() -> None:
-    """There is no way to call lookup_order without saying who is asking."""
-    signature = inspect.signature(lookup_order)
-    assert signature.parameters["customer_id"].default is inspect.Parameter.empty
+    """There is no way to call lookup_order without saying who is asking — in
+    either mode. The order id is the optional one."""
+    parameters = inspect.signature(lookup_order).parameters
+
+    assert parameters["customer_id"].default is inspect.Parameter.empty
+    assert parameters["order_id"].default is None
 
 
 def test_lookup_order_does_not_leak_fixture_annotations(now: datetime) -> None:
     """`scenario` is a note to whoever reads the JSON, not data for the model."""
-    details = lookup_order("ORD-1007", "CUST-002", now=now)
+    details = lookup_order("CUST-002", "ORD-1007", now=now)
     assert details is not None
     assert details.order.scenario is None
     assert "RET-5001" not in details.model_dump_json()
@@ -187,7 +225,7 @@ def test_lookup_order_does_not_leak_fixture_annotations(now: datetime) -> None:
 
 def test_shipment_reports_days_since_delivery(now: datetime) -> None:
     """ORD-1001 was delivered 2026-07-28 — 11 days before the fixed clock."""
-    details = lookup_order(IN_WINDOW_ORDER, HERO_CUSTOMER, now=now)
+    details = lookup_order(HERO_CUSTOMER, IN_WINDOW_ORDER, now=now)
     assert details is not None
     assert details.shipment.has_arrived is True
     assert details.shipment.days_since_delivery == 11
@@ -196,7 +234,7 @@ def test_shipment_reports_days_since_delivery(now: datetime) -> None:
 
 def test_in_transit_order_has_no_delivery_date(now: datetime) -> None:
     """ORD-1005 is still in transit, so no return clock has started."""
-    details = lookup_order("ORD-1005", "CUST-003", now=now)
+    details = lookup_order("CUST-003", "ORD-1005", now=now)
     assert details is not None
     assert details.order.delivered_at is None
     assert details.order.status == OrderStatus.IN_TRANSIT
@@ -207,7 +245,7 @@ def test_in_transit_order_has_no_delivery_date(now: datetime) -> None:
 
 def test_promotional_order_keeps_its_promotion_code(now: datetime) -> None:
     """Eligibility needs it to decide whether the holiday policy applies at all."""
-    details = lookup_order("ORD-1006", "CUST-004", now=now)
+    details = lookup_order("CUST-004", "ORD-1006", now=now)
     assert details is not None
     assert details.order.promotion_code == "MIDYEAR_HOLIDAY_SALE_2026"
 
@@ -337,6 +375,32 @@ def verified() -> SessionState:
         active_order_ids=[IN_WINDOW_ORDER],
         active_order_id=IN_WINDOW_ORDER,
     )
+
+
+def test_order_list_sends_ids_titles_and_statuses(verified, now: datetime) -> None:
+    """The discovery mode: what they have, in the words they would use for it."""
+    outcome = invoke_tool("lookup_order", {}, verified, now=now)
+    sent = json.loads(outcome.content)
+
+    assert set(sent) == {"orders"}
+    assert {order["order_id"] for order in sent["orders"]} == {IN_WINDOW_ORDER, "ORD-1002"}
+    assert set(sent["orders"][0]["items"][0]) == {"item_id", "title", "product_type"}
+    # Not the detailed mode's fields, which nobody asked for.
+    for absent in ("placed_at", "delivered_at", "price", "promotion_code", "customer_id"):
+        assert absent not in outcome.content
+
+
+def test_order_list_is_scoped_to_the_verified_customer(now: datetime) -> None:
+    """The model supplies no customer id, and cannot: it is injected from the
+    session, so there is nothing to point at another account."""
+    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+    outcome = invoke_tool("lookup_order", {}, bruce, now=now)
+
+    assert {order["order_id"] for order in json.loads(outcome.content)["orders"]} == {
+        "ORD-1003",
+        "ORD-1007",
+    }
+    assert outcome.args_used == {"customer_id": "CUST-002"}
 
 
 def test_order_lookup_sends_the_conversational_fields(verified, now: datetime) -> None:
@@ -494,6 +558,9 @@ def test_compaction_does_not_disturb_trusted_state(verified, seeded_graph, now: 
     apply_tool_result("verify_identity", {}, identity, state)
     assert state.verified_customer_id == HERO_CUSTOMER
     assert state.customer_region == "GB"
+
+    listed = invoke_tool("lookup_order", {}, state, now=now)
+    apply_tool_result("lookup_order", {}, listed, state)
     assert state.active_order_ids == [IN_WINDOW_ORDER, "ORD-1002"]
 
     order = invoke_tool("lookup_order", {"order_id": IN_WINDOW_ORDER}, state, now=now)

@@ -23,6 +23,10 @@ htmlcov/
 # Streamlit
 .streamlit/secrets.toml
 
+# Runtime logs
+logs/
+*.log
+
 # Editors and OS
 .DS_Store
 .idea/
