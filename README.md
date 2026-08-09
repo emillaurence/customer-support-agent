@@ -1,6 +1,6 @@
 # Bookly Support Agent
 
-Bookly is a fictional online bookstore. This repository is a working prototype of its customer support agent, built for the Decagon Solutions Engineering take-home.
+Bookly is a fictional online bookstore. This repository is a working prototype of its customer support agent.
 
 > Flexible in conversation. Controlled in action.
 
