@@ -112,7 +112,7 @@ Use Kenji (`kenji@example.com`).
 
 Watch for: two separate orders, each checked independently, both surfaced as eligible, a single confirmation that covers both selected returns, and two item-scoped `initiate_return` calls.
 
-Eligibility tokens are never shown to the customer or exposed in the reply — only in the underlying trace.
+Eligibility tokens are never shown to the customer or exposed in Agent Trace; they remain only in trusted server-side state.
 
 [See the full demo guide](docs/demo-guide.md)
 
@@ -151,13 +151,11 @@ Run the app:
 streamlit run app.py
 ```
 
-To put the demo data back to its starting state (restores `data/returns.json` and clears in-memory eligibility tokens):
-
 ```bash
 python scripts/reset_demo.py
 ```
 
-The same reset also runs from a "Reset demo" button in the app's sidebar.
+The reset script restores `data/returns.json` and resets the demo token store. When running the Streamlit app, use the sidebar **Reset demo** button to also reset the active conversation state.
 
 ## Tests
 
