@@ -427,9 +427,15 @@ def test_eligibility_decision_keeps_sonnet(verified_state) -> None:
 
 def test_pending_confirmation_uses_sonnet(verified_state) -> None:
     """The turn that might authorise a write is the last one to run cheaply."""
-    verified_state.pending_return = PendingReturn(
-        order_id=IN_WINDOW_ORDER, item_id=IN_WINDOW_ITEM, eligibility_token="tok", asked=True
-    )
+    verified_state.pending_returns = [
+        PendingReturn(
+            customer_id=HERO_CUSTOMER,
+            order_id=IN_WINDOW_ORDER,
+            item_id=IN_WINDOW_ITEM,
+            eligibility_token="tok",
+            asked=True,
+        )
+    ]
     assert route("yes please", verified_state) is ModelTier.SONNET
     assert route("Yes, go ahead", verified_state) is ModelTier.SONNET
 
@@ -452,8 +458,15 @@ def test_a_policy_question_mid_workflow_stays_on_sonnet(verified_state) -> None:
 
 
 def test_confirmed_return_uses_sonnet(verified_state) -> None:
-    verified_state.confirmed = True
-    verified_state.eligibility_token = "tok"
+    verified_state.pending_returns = [
+        PendingReturn(
+            customer_id=HERO_CUSTOMER,
+            order_id=IN_WINDOW_ORDER,
+            item_id=IN_WINDOW_ITEM,
+            eligibility_token="tok",
+            confirmed=True,
+        )
+    ]
     assert route("thanks", verified_state) is ModelTier.SONNET
 
 
@@ -487,10 +500,18 @@ def test_every_decision_carries_a_reason() -> None:
 
 def test_promotion_is_one_way_within_a_workflow(verified_state) -> None:
     """Walks the workflow with messages that would each route to Haiku alone."""
-    for item_id, token, message in [(IN_WINDOW_ITEM, None, "ok"), (IN_WINDOW_ITEM, "tok", "right")]:
-        verified_state.active_item_id = item_id
-        verified_state.eligibility_token = token
-        assert route(message, verified_state) is ModelTier.SONNET
+    verified_state.active_item_id = IN_WINDOW_ITEM
+    assert route("ok", verified_state) is ModelTier.SONNET
+
+    verified_state.pending_returns = [
+        PendingReturn(
+            customer_id=HERO_CUSTOMER,
+            order_id=IN_WINDOW_ORDER,
+            item_id=IN_WINDOW_ITEM,
+            eligibility_token="tok",
+        )
+    ]
+    assert route("right", verified_state) is ModelTier.SONNET
 
 
 @pytest.mark.parametrize(
@@ -719,7 +740,7 @@ def test_loop_continues_across_several_rounds(make_agent, seeded_graph) -> None:
 
     assert len(client.calls) == 4
     assert state.eligibility is not None and state.eligibility.eligible
-    assert state.pending_return is not None
+    assert len(state.pending_returns) == 1
     assert tool_names(state) == ["verify_identity", "lookup_order", "check_return_eligibility"]
 
 
@@ -926,7 +947,8 @@ def test_switching_item_clears_the_previous_return_context(
         text("That's returnable. Shall I start a return?"),
     )
     agent.respond(verified_state, "I want to return the paperback")
-    first_token = verified_state.eligibility_token
+    assert len(verified_state.pending_returns) == 1
+    first_token = verified_state.pending_returns[0].eligibility_token
     assert first_token is not None
 
     agent2, _ = make_agent(
@@ -935,8 +957,10 @@ def test_switching_item_clears_the_previous_return_context(
     )
     agent2.respond(verified_state, "actually I meant the other order, ORD-1002")
 
-    assert verified_state.eligibility_token != first_token
-    assert verified_state.confirmed is False
+    # The new item is outside its window, so nothing is pending at all — and in
+    # particular not the old item's token, which the switch must not leave behind.
+    assert verified_state.pending_returns == []
+    assert verified_state.may_mutate is False
     assert verified_state.active_item_id == EXPIRED_ITEM
 
 
@@ -961,8 +985,7 @@ def test_yes_with_no_pending_action_does_not_confirm(make_agent) -> None:
 
     agent.respond(state, "yes")
 
-    assert state.confirmed is False
-    assert state.pending_return is None
+    assert state.pending_returns == []
     assert state.may_mutate is False
 
 
@@ -977,13 +1000,13 @@ def test_yes_after_a_statement_does_not_confirm(make_agent, seeded_graph, verifi
         text("Good news — that one is eligible, with 19 days left."),
     )
     agent.respond(verified_state, "can I return the paperback?")
-    assert verified_state.pending_return is not None
+    assert len(verified_state.pending_returns) == 1
 
     agent2, _ = make_agent(text("Would you like me to start it?"))
     agent2.respond(verified_state, "yes")
 
-    assert verified_state.confirmed is False
-    assert verified_state.pending_return.asked is False
+    assert verified_state.may_mutate is False
+    assert verified_state.pending_returns[0].asked is False
 
 
 def test_yes_after_an_explicit_request_confirms(make_agent, seeded_graph, verified_state) -> None:
@@ -998,9 +1021,10 @@ def test_yes_after_an_explicit_request_confirms(make_agent, seeded_graph, verifi
     agent2, _ = make_agent(text("Done — your return is open."))
     agent2.respond(verified_state, "yes please")
 
-    assert verified_state.confirmed is True
     assert verified_state.may_mutate is True
-    assert verified_state.pending_return.order_id == IN_WINDOW_ORDER
+    assert len(verified_state.pending_returns) == 1
+    assert verified_state.pending_returns[0].confirmed is True
+    assert verified_state.pending_returns[0].order_id == IN_WINDOW_ORDER
 
 
 def test_confirmed_return_can_be_opened(make_agent, seeded_graph, verified_state) -> None:
@@ -1029,8 +1053,8 @@ def test_confirmed_return_can_be_opened(make_agent, seeded_graph, verified_state
     assert trace.status is ToolStatus.OK
     assert "created=True" in trace.result_summary
     # The workflow is over: a later "yes" cannot re-open anything.
-    assert verified_state.confirmed is False
-    assert verified_state.eligibility_token is None
+    assert verified_state.pending_returns == []
+    assert verified_state.may_mutate is False
 
 
 def test_confirmation_does_not_survive_an_item_switch(
@@ -1045,7 +1069,7 @@ def test_confirmation_does_not_survive_an_item_switch(
 
     agent2, _ = make_agent(text("Which one did you mean?"))
     agent2.respond(verified_state, "yes")
-    assert verified_state.confirmed is True
+    assert verified_state.may_mutate is True
 
     agent3, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": EXPIRED_ORDER, "item_id": EXPIRED_ITEM}),
@@ -1053,9 +1077,8 @@ def test_confirmation_does_not_survive_an_item_switch(
     )
     agent3.respond(verified_state, "actually I meant the one from ORD-1002")
 
-    assert verified_state.confirmed is False
-    assert verified_state.eligibility_token is None
-    assert verified_state.pending_return is None
+    assert verified_state.may_mutate is False
+    assert verified_state.pending_returns == []
 
 
 # =========================================================================
@@ -1405,7 +1428,7 @@ def test_a_uniquely_named_book_goes_straight_to_eligibility(make_agent, seeded_g
     assert state.eligibility is not None
     assert state.eligibility.eligible is False
     assert state.eligibility.policy_id == "DIGITAL_NO_RETURN"
-    assert state.pending_return is None
+    assert state.pending_returns == []
 
 
 def test_an_ambiguous_request_is_asked_about_before_anything_is_decided(
@@ -1470,6 +1493,229 @@ def test_verifying_identity_outside_a_return_does_not_auto_load_orders(
     agent.respond(state, HERO_EMAIL)
 
     assert tool_names(state) == ["verify_identity"]
+
+
+PHYSICAL_ITEM = "ITEM-102"
+"""Bruce's A Short History of Nearly Everything — the physical book on
+EBOOK_ORDER, in the AU extended window; EBOOK_ITEM on the same order is his
+Clean Architecture ebook, which DIGITAL_NO_RETURN always refuses."""
+
+
+@pytest.fixture
+def bruce_verified() -> SessionState:
+    """Bruce, verified, with ORD-1003 — physical book and ebook — on record."""
+    return SessionState(
+        verified_customer_id=BRUCE_CUSTOMER,
+        customer_region="AU",
+        active_order_ids=[EBOOK_ORDER, "ORD-1007"],
+        active_order_id=EBOOK_ORDER,
+    )
+
+
+def test_checking_both_items_on_an_order_leaves_the_eligible_one_pending(
+    make_agent, seeded_graph, bruce_verified
+) -> None:
+    """"Am I eligible to return all of ORD-1003?" checks both items in one turn.
+    The ebook's refusal must not erase the physical book's grant — this is the
+    exact session that surfaced the bug: a later, ineligible result wiping the
+    only pending action a "yes" could act on."""
+    agent, _ = make_agent(
+        tool_calls(
+            ("check_return_eligibility", {"order_id": EBOOK_ORDER, "item_id": PHYSICAL_ITEM}),
+            ("check_return_eligibility", {"order_id": EBOOK_ORDER, "item_id": EBOOK_ITEM}),
+        ),
+        text(
+            "The Short History of Nearly Everything can be returned. Clean "
+            "Architecture, the ebook, can't. Shall I start a return for the "
+            "physical book?"
+        ),
+    )
+
+    agent.respond(bruce_verified, "am i eligible to return all of ord-1003")
+
+    assert tool_names(bruce_verified) == ["check_return_eligibility", "check_return_eligibility"]
+    assert len(bruce_verified.pending_returns) == 1
+    assert bruce_verified.pending_returns[0].item_id == PHYSICAL_ITEM
+    assert bruce_verified.pending_returns[0].confirmed is False
+    assert bruce_verified.may_mutate is False
+
+    # Each check still traces its own policy decision — the batch reconciliation
+    # decides what is pending, not what a trace says about one call.
+    physical_trace, ebook_trace = bruce_verified.tool_traces
+    assert physical_trace.policy_decision["eligible"] is True
+    assert physical_trace.policy_decision["policy_id"] == "AU_BOOKLY_EXTENDED_RETURN"
+    assert ebook_trace.policy_decision["eligible"] is False
+    assert ebook_trace.policy_decision["policy_id"] == "DIGITAL_NO_RETURN"
+
+
+def test_confirming_after_a_multi_item_check_opens_the_return_immediately(
+    make_agent, seeded_graph, bruce_verified
+) -> None:
+    """The scenario that used to escalate: "yes" after checking two items must
+    confirm and open the return in one pass — no blocked confirmed=False call,
+    no repeated confirmation, and no human escalation for what was a session
+    bug rather than a real failure."""
+    agent, _ = make_agent(
+        tool_calls(
+            ("check_return_eligibility", {"order_id": EBOOK_ORDER, "item_id": PHYSICAL_ITEM}),
+            ("check_return_eligibility", {"order_id": EBOOK_ORDER, "item_id": EBOOK_ITEM}),
+        ),
+        text(
+            "The physical book can be returned; the ebook can't. Would you like "
+            "me to start the return for A Short History of Nearly Everything?"
+        ),
+        tool_call(
+            "initiate_return", {"order_id": EBOOK_ORDER, "item_id": PHYSICAL_ITEM}, block_id="toolu_write"
+        ),
+        text("Your return is open. You'll get an email with the next steps."),
+    )
+
+    agent.respond(bruce_verified, "am i eligible to return all of ord-1003")
+    agent.respond(bruce_verified, "yes")
+
+    assert tool_names(bruce_verified) == [
+        "check_return_eligibility",
+        "check_return_eligibility",
+        "initiate_return",
+    ]
+    write_trace = bruce_verified.tool_traces[-1]
+    assert write_trace.status is ToolStatus.OK
+    assert write_trace.tool_args["confirmed"] is True
+    assert "escalate_to_human" not in tool_names(bruce_verified)
+    assert bruce_verified.pending_returns == []
+    assert len(returns_in_process(EBOOK_ORDER, PHYSICAL_ITEM)) == 1
+
+
+def returns_in_process(order_id: str, item_id: str) -> list[dict]:
+    """The RMAs actually written for one order/item, straight off disk — proof
+    the write happened once, not just that the tool reported success."""
+    from agent.tools import _load_returns
+
+    return [r for r in _load_returns() if r.order_id == order_id and r.item_id == item_id]
+
+
+KENJI_CUSTOMER, KENJI_EMAIL = "CUST-004", "kenji@example.com"
+KENJI_ORDER_A, KENJI_ITEM_A = "ORD-1006", "ITEM-103"  # The Midnight Library
+KENJI_ORDER_B, KENJI_ITEM_B = "ORD-1008", "ITEM-101"  # Designing Data-Intensive Applications
+
+
+def test_two_eligible_items_with_no_selection_stay_pending_but_unconfirmed(
+    make_agent, seeded_graph
+) -> None:
+    """Case C at the loop level: two eligible candidates in one turn, and the
+    customer has not said which — or that they want both.
+
+    This used to erase both candidates outright, on the theory that a "yes"
+    would not say which one it meant. That was wrong: erasing them lost real,
+    eligible candidates a later "both" could still act on. The right response is
+    to keep both pending, unconfirmed, and let the agent ask — a bare "yes" here
+    must not open either one.
+    """
+    state = SessionState(verified_customer_id=KENJI_CUSTOMER, customer_region="US")
+
+    agent, _ = make_agent(
+        tool_calls(
+            ("check_return_eligibility", {"order_id": KENJI_ORDER_A, "item_id": KENJI_ITEM_A}),
+            ("check_return_eligibility", {"order_id": KENJI_ORDER_B, "item_id": KENJI_ITEM_B}),
+        ),
+        text("Both of those can be returned. Which one would you like to return?"),
+    )
+    agent.respond(state, "can I return both of my books")
+
+    assert len(state.pending_returns) == 2
+    assert not any(pending.confirmed for pending in state.pending_returns)
+    assert state.may_mutate is False
+
+    agent2, _ = make_agent(text("Sure — anything else?"))
+    agent2.respond(state, "yes")
+
+    assert not any(pending.confirmed for pending in state.pending_returns)
+    assert state.may_mutate is False
+
+
+def test_kenji_multi_item_return_end_to_end(make_agent, seeded_graph) -> None:
+    """The scenario that used to escalate: two eligible items, confirmed together
+    with one "both", must open two returns — no blocked call, no repeated
+    confirmation, and no escalation for what was a session-state bug."""
+    state = SessionState()
+
+    agent, _ = make_agent(
+        # `lookup_order` is not scripted — verifying mid-return-workflow triggers
+        # it deterministically (see `_run_tool_loop`), the same as elsewhere.
+        tool_call("verify_identity", {"email": KENJI_EMAIL}),
+        text(
+            "Thanks Kenji. You've got Designing Data-Intensive Applications on "
+            "ORD-1008 and The Midnight Library on ORD-1006."
+        ),
+    )
+    agent.respond(state, f"I want to return my orders, it's {KENJI_EMAIL}")
+    assert tool_names(state) == ["verify_identity", "lookup_order"]
+
+    agent2, _ = make_agent(
+        tool_calls(
+            ("check_return_eligibility", {"order_id": KENJI_ORDER_B, "item_id": KENJI_ITEM_B}),
+            ("check_return_eligibility", {"order_id": KENJI_ORDER_A, "item_id": KENJI_ITEM_A}),
+        ),
+        text("Both are eligible. Would you like me to start returns for both?"),
+    )
+    agent2.respond(state, "am I eligible for both?")
+
+    assert len(state.pending_returns) == 2
+    assert not any(pending.confirmed for pending in state.pending_returns)
+
+    agent3, _ = make_agent(
+        tool_calls(
+            ("initiate_return", {"order_id": KENJI_ORDER_B, "item_id": KENJI_ITEM_B}),
+            ("initiate_return", {"order_id": KENJI_ORDER_A, "item_id": KENJI_ITEM_A}),
+        ),
+        text("Both returns are open. You'll get emails with the next steps."),
+    )
+    agent3.respond(state, "yes please")
+
+    assert tool_names(state) == [
+        "verify_identity",
+        "lookup_order",
+        "check_return_eligibility",
+        "check_return_eligibility",
+        "initiate_return",
+        "initiate_return",
+    ]
+    write_traces = [t for t in state.tool_traces if t.tool_name == "initiate_return"]
+    assert len(write_traces) == 2
+    assert all(t.status is ToolStatus.OK for t in write_traces)
+    assert all(t.tool_args["confirmed"] is True for t in write_traces)
+    assert "escalate_to_human" not in tool_names(state)
+    assert state.pending_returns == []
+    assert len(returns_in_process(KENJI_ORDER_B, KENJI_ITEM_B)) == 1
+    assert len(returns_in_process(KENJI_ORDER_A, KENJI_ITEM_A)) == 1
+
+
+def test_a_blocked_confirmation_guard_does_not_trigger_escalation(
+    make_agent, seeded_graph, verified_state
+) -> None:
+    """A guard refusal — initiate_return called with confirmed=False — is an
+    internal state bug, not a reason to hand the customer to a person. The
+    agent is expected to ask for confirmation again, never to escalate solely
+    because the guard blocked the write."""
+    agent, _ = make_agent(
+        tool_call(
+            "check_return_eligibility",
+            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
+        ),
+        # The model asks for the write before the customer has actually said
+        # yes — confirmed is False on the session, so the guard blocks it.
+        tool_call(
+            "initiate_return", {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM}
+        ),
+        text("Shall I start the return? Just say the word and I will."),
+    )
+
+    agent.respond(verified_state, "I want to return it")
+
+    assert tool_names(verified_state) == ["check_return_eligibility", "initiate_return"]
+    assert verified_state.tool_traces[-1].status is ToolStatus.BLOCKED
+    assert "escalate_to_human" not in tool_names(verified_state)
+    assert verified_state.escalated is False
 
 
 def test_the_listing_alone_cannot_reach_another_customers_order(make_agent) -> None:
@@ -1676,11 +1922,11 @@ def test_eligible_return_leaves_something_to_confirm(make_agent, seeded_graph, h
     agent.respond(state, "Actually, I want to return it.")
 
     assert state.eligibility is not None and state.eligibility.eligible
-    assert state.eligibility_token is not None
-    assert state.pending_return is not None
-    assert state.pending_return.order_id == IN_WINDOW_ORDER
-    assert state.pending_return.item_id == IN_WINDOW_ITEM
-    assert state.confirmed is False  # asked, but not yet answered
+    assert len(state.pending_returns) == 1
+    assert state.pending_returns[0].eligibility_token is not None
+    assert state.pending_returns[0].order_id == IN_WINDOW_ORDER
+    assert state.pending_returns[0].item_id == IN_WINDOW_ITEM
+    assert state.pending_returns[0].confirmed is False  # asked, but not yet answered
     assert state.active_item_id == IN_WINDOW_ITEM
     assert state.return_reason == "Not what I expected."
 
@@ -1696,9 +1942,8 @@ def test_return_workflow_state_is_cleared_after_the_write(
     run_hero_flow(agent, state)
 
     assert state.verified_customer_id == HERO_CUSTOMER
-    assert state.eligibility_token is None
-    assert state.pending_return is None
-    assert state.confirmed is False
+    assert state.pending_returns == []
+    assert state.may_mutate is False
 
 
 def test_hero_flow_routing_is_the_generic_router(make_agent, seeded_graph, hero_script) -> None:
@@ -1852,7 +2097,7 @@ def test_repeating_the_hero_return_does_not_create_a_second_rma(
 
     assert verified_state.eligibility is not None
     assert verified_state.eligibility.eligible is False
-    assert verified_state.eligibility_token is None
+    assert verified_state.pending_returns == []
     assert len([r for r in returns_in(data_dir) if r["order_id"] == IN_WINDOW_ORDER]) == 1
 
 
@@ -1912,7 +2157,7 @@ def test_return_phrasings_all_reach_the_eligibility_check(
     agent.respond(hero_verified, phrasing)
 
     assert tool_names(hero_verified) == ["check_return_eligibility"]
-    assert hero_verified.pending_return is not None
+    assert len(hero_verified.pending_returns) == 1
     assert hero_verified.model_turns[0].model_tier == ModelTier.SONNET
 
 

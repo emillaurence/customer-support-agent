@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from agent.state import (
     EligibilityDecision,
     ModelTurn,
+    PendingReturn,
     Role,
     SessionState,
     ToolStatus,
@@ -46,8 +47,11 @@ from agent.tools import (
     TOOL_SCHEMAS,
     EscalationResult,
     ReturnResult,
+    ToolOutcome,
     apply_tool_result,
     invoke_tool,
+    item_title,
+    reconcile_eligibility_batch,
 )
 
 LOG = logging.getLogger("bookly")
@@ -330,10 +334,8 @@ def select_model(state: SessionState, user_message: str) -> ModelDecision:
         return ModelDecision(tier=ModelTier.SONNET, reason="conversation is escalated")
     if state.return_workflow_active:
         return ModelDecision(tier=ModelTier.SONNET, reason="a return workflow is open")
-    if state.pending_return is not None:
+    if state.pending_returns:
         return ModelDecision(tier=ModelTier.SONNET, reason="a return is awaiting confirmation")
-    if state.confirmed:
-        return ModelDecision(tier=ModelTier.SONNET, reason="a confirmed return is pending")
 
     # Intent that needs reasoning, or will change records.
     if _is_informational_policy_question(text, state):
@@ -449,6 +451,45 @@ def asks_for_confirmation(assistant_message: str) -> bool:
     with it confirms nothing."""
     text = assistant_message.lower()
     return "?" in text and any(cue in text for cue in CONFIRMATION_CUES)
+
+
+ALL_PENDING_CUES: tuple[str, ...] = (
+    "both", "all of them", "all of these", "all three", "everything",
+    "each one", "each of them",
+)
+"""Phrasing that asks about every pending return at once, rather than naming one.
+"Would you like me to start returns for both?" never repeats a title, so a
+confirmation question can only be matched to more than one pending return by a
+cue like this — or by naming each one, which `_confirmation_targets` also
+checks for."""
+
+
+def _confirmation_targets(
+    assistant_message: str, pending: list[PendingReturn]
+) -> list[PendingReturn]:
+    """Which of the currently pending returns a confirmation question was about.
+
+    One pending return is unambiguous — there is nothing else it could mean.
+    With more than one, the question has to say so: either a cue that reaches
+    for all of them ("both", "all of them"), or by naming the item, order, or
+    title of the ones it means. Naming none of them is not "all of them" — it
+    means Python cannot tell, so nothing is targeted and nothing is confirmed
+    until the agent is specific.
+    """
+    if len(pending) <= 1:
+        return list(pending)
+
+    text = assistant_message.lower()
+    if any(cue in text for cue in ALL_PENDING_CUES):
+        return list(pending)
+
+    return [
+        candidate
+        for candidate in pending
+        if candidate.order_id.lower() in text
+        or candidate.item_id.lower() in text
+        or ((title := item_title(candidate.item_id)) and title.lower() in text)
+    ]
 
 
 # --- The loop ------------------------------------------------------------
@@ -642,15 +683,20 @@ class BooklyAgent:
             # user message — what the Messages API expects, and splitting them
             # teaches the model not to ask for more than one at a time.
             adopt_active_order = not _browsing_orders(tool_uses)
-            adopt_active_item = not _comparing_items(tool_uses)
             results = []
+            eligibility_batch: list[tuple[str, str, EligibilityDecision]] = []
             for block in tool_uses:
                 turn.tool_calls += 1
-                results.append(
-                    self._run_one_tool(
-                        state, decision, model_id, block, adopt_active_order, adopt_active_item
-                    )
+                result, outcome = self._run_one_tool(
+                    state, decision, model_id, block, adopt_active_order
                 )
+                results.append(result)
+                if getattr(block, "name", "") == "check_return_eligibility" and isinstance(
+                    outcome.payload, EligibilityDecision
+                ):
+                    eligibility_batch.append(
+                        (outcome.args_used["order_id"], outcome.args_used["item_id"], outcome.payload)
+                    )
 
             # Identity just verified, a return workflow already open, and no
             # order on record yet: `lookup_order` is not a choice Claude has to
@@ -672,11 +718,17 @@ class BooklyAgent:
                 state.transcript[-1]["content"].append(
                     {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
                 )
-                results.append(
-                    self._run_one_tool(
-                        state, decision, model_id, block, adopt_active_order, adopt_active_item
-                    )
+                result, _outcome = self._run_one_tool(
+                    state, decision, model_id, block, adopt_active_order
                 )
+                results.append(result)
+
+            if eligibility_batch:
+                # Every check this turn has run; decide once, from all of them
+                # together, what — if anything — is left pending. See
+                # reconcile_eligibility_batch: a lone eligible candidate becomes
+                # the pending return, and zero or several leave nothing pending.
+                reconcile_eligibility_batch(state, eligibility_batch)
 
             state.transcript.append({"role": "user", "content": results})
 
@@ -692,9 +744,13 @@ class BooklyAgent:
         model_id: str,
         block: Any,
         adopt_active_order: bool,
-        adopt_active_item: bool = True,
-    ) -> dict[str, Any]:
-        """Run one requested tool, trace it, and update state from what it returned."""
+    ) -> tuple[dict[str, Any], ToolOutcome]:
+        """Run one requested tool, trace it, and update state from what it returned.
+
+        Returns the tool_result block for the transcript, and the outcome itself
+        — the caller reads the outcome to collect this turn's
+        `check_return_eligibility` calls into a batch; nothing else needs it.
+        """
         name = getattr(block, "name", "")
         args = dict(getattr(block, "input", None) or {})
 
@@ -705,14 +761,7 @@ class BooklyAgent:
         # State is updated only from a tool that actually succeeded. A blocked
         # guard or a failed call leaves the session exactly as it was.
         if outcome.status is ToolStatus.OK:
-            apply_tool_result(
-                name,
-                args,
-                outcome,
-                state,
-                adopt_active_order=adopt_active_order,
-                adopt_active_item=adopt_active_item,
-            )
+            apply_tool_result(name, args, outcome, state, adopt_active_order=adopt_active_order)
 
         # The arguments as they were actually used — trusted values included, so
         # the trace shows the real call — with anything sensitive masked. The log
@@ -740,31 +789,41 @@ class BooklyAgent:
             _log_facts(outcome.payload),
         )
 
-        return {
-            "type": "tool_result",
-            "tool_use_id": getattr(block, "id", ""),
-            "content": outcome.content,
-            "is_error": outcome.is_error,
-        }
+        return (
+            {
+                "type": "tool_result",
+                "tool_use_id": getattr(block, "id", ""),
+                "content": outcome.content,
+                "is_error": outcome.is_error,
+            },
+            outcome,
+        )
 
     def _update_confirmation(self, state: SessionState, user_message: str) -> None:
-        """Decide whether this message confirms the pending return. A bare "yes"
-        with nothing pending writes no field at all."""
-        pending = state.pending_return
-        if pending is None:
+        """Decide whether this message confirms one or more pending returns. A
+        bare "yes" with nothing pending writes no field at all."""
+        pending = [candidate for candidate in state.pending_returns if not candidate.confirmed]
+        if not pending:
             return
 
         last_assistant = state.last_assistant_message()
         if last_assistant is None:
             return
 
-        # Did the agent actually ask? Recorded on the pending action so it
-        # survives the turn and cannot be re-derived from a later message.
+        # Did the agent actually ask, and about which of these? The last question
+        # asked is the only one a "yes" can answer, so a fresh one replaces
+        # whichever pending returns an earlier question had targeted — a "yes" to
+        # "shall I return Book A?" must not still be live once the agent has gone
+        # on to ask about Book B instead.
         if asks_for_confirmation(last_assistant):
-            pending.asked = True
+            targets = set(map(id, _confirmation_targets(last_assistant, pending)))
+            for candidate in pending:
+                candidate.asked = id(candidate) in targets
 
-        if pending.asked and is_affirmative(user_message):
-            state.confirmed = True
+        if is_affirmative(user_message):
+            for candidate in pending:
+                if candidate.asked:
+                    candidate.confirmed = True
 
     def _model_id(self, decision: ModelDecision) -> str:
         """Resolve a tier to the model id the environment configured for it."""
@@ -879,23 +938,6 @@ def _browsing_orders(tool_uses: list[Any]) -> bool:
         if getattr(block, "name", "") == "lookup_order"
     }
     return len(order_ids - {None}) > 1
-
-
-def _comparing_items(tool_uses: list[Any]) -> bool:
-    """Whether this response is checking several items against each other rather
-    than settling on one.
-
-    Mirrors `_browsing_orders`: to weigh two items — "is the paperback eligible,
-    or only the ebook?" — the agent checks both in the same turn. Treating the
-    second check as the customer abandoning the first would drop a pending
-    return, and its token, that nothing has actually reopened.
-    """
-    item_ids = {
-        (getattr(block, "input", None) or {}).get("item_id")
-        for block in tool_uses
-        if getattr(block, "name", "") == "check_return_eligibility"
-    }
-    return len(item_ids - {None}) > 1
 
 
 def _assistant_text(text: str) -> dict[str, Any]:

@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from agent.agent import asks_for_confirmation, is_affirmative
-from agent.state import SessionState, ToolStatus
+from agent.state import PendingReturn, SessionState, ToolStatus
 from agent.tools import (
     TOOL_SCHEMAS,
     ReturnBlockedError,
@@ -157,13 +157,23 @@ def test_return_without_explicit_confirmation_is_blocked(token: str, data_dir: P
 
 
 def test_confirmation_is_not_taken_from_session_state(token: str) -> None:
-    """`state.confirmed` being True does not by itself authorise a write.
+    """A pending return marked confirmed on the session does not by itself
+    authorise a write.
 
     Guards against the confirmation gate drifting back into `SessionState`: the
     value has to arrive as an argument to the tool.
     """
     state = SessionState(
-        verified_customer_id=HERO_CUSTOMER, eligibility_token=token, confirmed=True
+        verified_customer_id=HERO_CUSTOMER,
+        pending_returns=[
+            PendingReturn(
+                customer_id=HERO_CUSTOMER,
+                order_id=IN_WINDOW_ORDER,
+                item_id=IN_WINDOW_ITEM,
+                eligibility_token=token,
+                confirmed=True,
+            )
+        ],
     )
     assert state.may_mutate is True  # the loop would allow it...
 
@@ -176,9 +186,19 @@ def test_session_may_mutate_needs_all_three_gates(token: str) -> None:
     """The loop's own check, for completeness. Not the safety boundary."""
     assert SessionState().may_mutate is False
     assert SessionState(verified_customer_id=HERO_CUSTOMER).may_mutate is False
-    assert (
-        SessionState(verified_customer_id=HERO_CUSTOMER, eligibility_token=token).may_mutate is False
+
+    unconfirmed = SessionState(
+        verified_customer_id=HERO_CUSTOMER,
+        pending_returns=[
+            PendingReturn(
+                customer_id=HERO_CUSTOMER,
+                order_id=IN_WINDOW_ORDER,
+                item_id=IN_WINDOW_ITEM,
+                eligibility_token=token,
+            )
+        ],
     )
+    assert unconfirmed.may_mutate is False
 
 
 def test_the_model_cannot_express_confirmation_or_a_token() -> None:
@@ -252,7 +272,7 @@ def test_a_refused_write_is_reported_as_refused(make_agent, verified_state) -> N
     agent.respond(verified_state, "open a return for ITEM-100")
 
     assert verified_state.tool_traces[0].status is ToolStatus.BLOCKED
-    assert verified_state.confirmed is False
+    assert verified_state.pending_returns == []
 
 
 # =========================================================================
@@ -388,7 +408,8 @@ def test_the_traced_call_never_records_the_token(make_agent, verified_state) -> 
         text(CONFIRM_QUESTION),
     )
     agent.respond(verified_state, "I'd like to return the paperback")
-    token = verified_state.eligibility_token
+    assert len(verified_state.pending_returns) == 1
+    token = verified_state.pending_returns[0].eligibility_token
     assert token
 
     agent2, _ = make_agent(
@@ -603,8 +624,7 @@ def test_outside_window_return_is_refused_with_a_reason(make_agent, hero_verifie
     assert decision is not None
     assert decision.eligible is False
     assert "outside the window" in decision.explanation
-    assert hero_verified.eligibility_token is None
-    assert hero_verified.pending_return is None
+    assert hero_verified.pending_returns == []
 
 
 def test_outside_window_yes_authorises_nothing(make_agent, hero_verified, data_dir) -> None:
@@ -631,7 +651,7 @@ def test_outside_window_yes_authorises_nothing(make_agent, hero_verified, data_d
     )
     agent2.respond(hero_verified, "Yes, go ahead")
 
-    assert hero_verified.confirmed is False
+    assert hero_verified.may_mutate is False
     write_trace = hero_verified.tool_traces[-1]
     assert write_trace.tool_name == "initiate_return"
     assert write_trace.status is ToolStatus.BLOCKED
@@ -662,7 +682,7 @@ def test_the_same_words_authorise_nothing_out_of_context(
 
     agent.respond(hero_verified, phrasing)
 
-    assert hero_verified.confirmed is False
+    assert hero_verified.pending_returns == []
     assert hero_verified.may_mutate is False
 
 
@@ -680,6 +700,6 @@ def test_agreeing_with_a_statement_is_not_a_confirmation(make_agent, hero_verifi
     agent.respond(hero_verified, "I'd like to return it")
     agent.respond(hero_verified, "yes please")
 
-    assert hero_verified.pending_return is not None
-    assert hero_verified.pending_return.asked is False
-    assert hero_verified.confirmed is False
+    assert len(hero_verified.pending_returns) == 1
+    assert hero_verified.pending_returns[0].asked is False
+    assert hero_verified.may_mutate is False

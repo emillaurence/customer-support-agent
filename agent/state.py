@@ -260,18 +260,32 @@ class Message(BaseModel):
 
 
 class PendingReturn(BaseModel):
-    """A return that passed eligibility and is waiting on the customer's yes.
+    """One return that passed eligibility and is waiting on the customer's yes.
 
     Created only from a successful, eligible check, so its existence is what makes
-    a later "yes" mean something. It carries the order and item, so a confirmation
-    is *for a specific return* and switching item drops it along with the token.
+    a later "yes" mean something. Everything a mutation needs to trust *this*
+    return is carried on the return itself — customer, order, item, token,
+    whether the agent has asked, whether the customer has agreed — so a session
+    can hold several of these at once (one per eligible item) with no shared
+    field one of them could borrow from another. A token issued for ORD-1008
+    authorises nothing on ORD-1006, and being confirmed on one does not confirm
+    the other.
     """
 
+    customer_id: str
     order_id: str
     item_id: str
     eligibility_token: str
     asked: bool = Field(
         default=False, description="True once the agent has actually asked about this return."
+    )
+    confirmed: bool = Field(
+        default=False,
+        description=(
+            "True once the customer has explicitly said yes to this exact return. "
+            "Bookkeeping only — it must be passed explicitly to initiate_return, which "
+            "does its own check and never reads session state."
+        ),
     )
 
 
@@ -313,18 +327,13 @@ class SessionState(BaseModel):
     eligibility: EligibilityDecision | None = Field(
         default=None, description="The last decision, kept so it can be quoted."
     )
-    eligibility_token: str | None = Field(
-        default=None, description="initiate_return will not act without it."
-    )
-    pending_return: PendingReturn | None = Field(
-        default=None, description="What a 'yes' would authorise. None means it authorises nothing."
-    )
-    confirmed: bool = Field(
-        default=False,
+    pending_returns: list[PendingReturn] = Field(
+        default_factory=list,
         description=(
-            "True once the customer has explicitly said yes to the described action. "
-            "Bookkeeping only — it must be passed explicitly to initiate_return, which "
-            "does its own check and never reads session state."
+            "What a 'yes' would authorise, one entry per eligible item still open. "
+            "Empty means it authorises nothing. A turn that checks several items can "
+            "leave several of these; each carries its own token and its own "
+            "confirmation, so a 'yes' to one does not authorise another."
         ),
     )
     escalated: bool = Field(default=False, description="True once handed to a human.")
@@ -358,19 +367,22 @@ class SessionState(BaseModel):
                 self.active_item_id is not None,
                 self.return_reason is not None,
                 self.eligibility is not None,
-                self.eligibility_token is not None,
-                self.pending_return is not None,
+                bool(self.pending_returns),
             )
         )
 
     @property
     def may_mutate(self) -> bool:
-        """Whether a write is permitted right now: identity, a token, a confirmation.
+        """Whether at least one pending return is currently safe to write.
 
-        The loop's own check, not the safety boundary — `initiate_return` re-checks
-        both from its arguments, so a bug here cannot let a mutation through.
+        Not itself the authority to write — `initiate_return` re-checks the exact
+        matching pending return from its own arguments, so a bug here cannot let a
+        mutation through. This just says whether *any* pending return is confirmed
+        and holds a token; it does not say which one.
         """
-        return self.is_verified and self.eligibility_token is not None and self.confirmed
+        return self.is_verified and any(
+            pending.confirmed and pending.eligibility_token for pending in self.pending_returns
+        )
 
     def add_message(self, role: Role, content: str) -> None:
         self.messages.append(Message(role=role, content=content))
@@ -381,17 +393,26 @@ class SessionState(BaseModel):
         return next((m.content for m in reversed(self.messages) if m.role is Role.ASSISTANT), None)
 
     def clear_return_context(self) -> None:
-        """Drop everything tied to one return attempt.
+        """Drop every pending return and everything said about it.
 
-        Called when the customer switches order or item, so a token issued for one
-        item can never be spent on another, and a yes given for one cannot
-        authorise a return of the next.
+        Called when the customer switches order or item — so a token issued for
+        one item can never be spent on another, and a yes given for one cannot
+        authorise a return of the next — and once the last pending return has
+        been written, so the workflow does not linger with nothing left to do.
         """
         self.active_order_id = None
         self.active_item_id = None
         self.return_reason = None
         self.return_intent_expressed = False
         self.eligibility = None
-        self.eligibility_token = None
-        self.pending_return = None
-        self.confirmed = False
+        self.pending_returns = []
+
+    def clear_account_context(self) -> None:
+        """Drop every trusted field scoped to the previously verified customer.
+
+        Called before adopting a new `verified_customer_id`, so a pending return,
+        a token, or a confirmation minted for one account can never be spent
+        under another.
+        """
+        self.clear_return_context()
+        self.active_order_ids = []

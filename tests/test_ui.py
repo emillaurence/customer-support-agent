@@ -25,6 +25,7 @@ from agent.agent import AnthropicConfigError, _policy_decision
 from agent.state import (
     EligibilityDecision,
     ModelTurn,
+    PendingReturn,
     Role,
     SessionState,
     ToolStatus,
@@ -722,8 +723,15 @@ def test_a_new_session_carries_nothing_over() -> None:
         customer_region="GB",
         active_order_id=IN_WINDOW_ORDER,
         active_item_id=IN_WINDOW_ITEM,
-        eligibility_token="tok",
-        confirmed=True,
+        pending_returns=[
+            PendingReturn(
+                customer_id=HERO_CUSTOMER,
+                order_id=IN_WINDOW_ORDER,
+                item_id=IN_WINDOW_ITEM,
+                eligibility_token="tok",
+                confirmed=True,
+            )
+        ],
         escalated=True,
     )
     used.add_message(Role.USER, "hello")
@@ -737,8 +745,7 @@ def test_a_new_session_carries_nothing_over() -> None:
     assert clean.model_turns == []
     assert clean.verified_customer_id is None
     assert clean.active_order_id is None
-    assert clean.eligibility_token is None
-    assert clean.confirmed is False
+    assert clean.pending_returns == []
     assert clean.escalated is False
     assert clean.may_mutate is False
 
@@ -1093,16 +1100,18 @@ def test_no_email_or_token_reaches_the_trace(app, hero_script) -> None:
 
 
 def test_the_developer_state_reports_a_token_without_showing_it(app, hero_script) -> None:
-    """Presence is the useful part; the value is a credential."""
+    """A count is the useful part; the value is a credential."""
     at = app(*hero_script)
     for message in HERO_PROMPTS[:4]:
         say(at, message)
 
     developer = next(b for b in at.sidebar.expander if b.label == ui.DEVELOPER_LABEL)
     shown = body(developer)
-    token = at.session_state["bookly_state"].eligibility_token
+    pending = at.session_state["bookly_state"].pending_returns
+    assert len(pending) == 1
+    token = pending[0].eligibility_token
     assert token
-    assert "held" in shown
+    assert "Pending returns" in shown and "1" in shown
     assert token not in shown
 
 
@@ -1129,7 +1138,7 @@ def test_the_outside_window_case_needs_no_special_display(app) -> None:
     assert "Not eligible" in shown
     assert "STANDARD_30_DAY" in shown
     assert "→ STANDARD_30_DAY" in shown
-    assert at.session_state["bookly_state"].eligibility_token is None
+    assert at.session_state["bookly_state"].pending_returns == []
 
 
 def test_reset_demo_clears_the_conversation_the_traces_and_the_data(

@@ -33,6 +33,7 @@ from agent.state import (
 )
 from agent.tools import (
     TOOL_SCHEMAS,
+    ToolOutcome,
     _load_returns,
     active_order_ids,
     apply_tool_result,
@@ -41,6 +42,7 @@ from agent.tools import (
     initiate_return,
     invoke_tool,
     lookup_order,
+    reconcile_eligibility_batch,
     verify_identity,
 )
 from tests.conftest import HERO_CUSTOMER, IN_WINDOW_ITEM, IN_WINDOW_ORDER
@@ -510,24 +512,16 @@ def test_return_creation_sends_the_reference_and_the_status(
     verified, seeded_graph, now: datetime
 ) -> None:
     """Whether it was opened or already existed, the RMA, and where it stands."""
-    invoke_tool(
+    decision = invoke_tool(
         "check_return_eligibility",
         {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
         verified,
         now=now,
     )
-    apply_tool_result(
-        "check_return_eligibility",
-        {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
-        invoke_tool(
-            "check_return_eligibility",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
-            verified,
-            now=now,
-        ),
-        verified,
+    reconcile_eligibility_batch(
+        verified, [(IN_WINDOW_ORDER, IN_WINDOW_ITEM, decision.payload)]
     )
-    verified.confirmed = True
+    verified.pending_returns[0].confirmed = True
 
     outcome = invoke_tool(
         "initiate_return",
@@ -587,66 +581,142 @@ def test_compaction_does_not_disturb_trusted_state(verified, seeded_graph, now: 
         decision,
         state,
     )
-    assert state.eligibility_token
-    assert state.pending_return is not None
+    reconcile_eligibility_batch(state, [(IN_WINDOW_ORDER, IN_WINDOW_ITEM, decision.payload)])
+    assert len(state.pending_returns) == 1
+    assert state.pending_returns[0].eligibility_token
     assert state.eligibility is not None and state.eligibility.rule_path
 
 
-def test_comparing_two_items_in_one_turn_keeps_the_first_grant(
+def test_one_eligible_item_in_a_batch_becomes_the_pending_return(
     verified, seeded_graph, now: datetime
 ) -> None:
-    """Checking a second item does not spend a token already granted for the first.
+    """Reconciling a batch with exactly one eligible candidate: Case B.
 
     Reproduces a real session: a customer's order carries a physical book (in
     the AU extended window) and an ebook (never returnable). Both get checked in
-    the same turn — "can I return either of these?" — and the ebook coming back
-    ineligible must not clear the pending return the paperback's check already
-    created. `adopt_active_item=False` is what one model turn checking several
-    items looks like; the loop computes it from the batch of tool calls.
+    the same turn — "can I return either of these?" — and the ebook's refusal
+    must not erase the pending return the paperback's check earns. Tool-call
+    order inside the batch must not matter either, so this runs it both ways.
     """
-    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
     order_id, physical_item, ebook_item = "ORD-1003", "ITEM-102", "ITEM-201"
 
-    eligible = invoke_tool(
-        "check_return_eligibility", {"order_id": order_id, "item_id": physical_item}, bruce, now=now
-    )
-    apply_tool_result(
-        "check_return_eligibility",
-        {"order_id": order_id, "item_id": physical_item},
-        eligible,
-        bruce,
-        adopt_active_item=False,
-    )
-    assert bruce.pending_return is not None
-    token_after_first_check = bruce.eligibility_token
-    assert token_after_first_check
+    def check(bruce: SessionState, item_id: str):
+        outcome = invoke_tool(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, bruce, now=now
+        )
+        apply_tool_result(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, bruce
+        )
+        return outcome
 
-    ineligible = invoke_tool(
-        "check_return_eligibility", {"order_id": order_id, "item_id": ebook_item}, bruce, now=now
-    )
-    apply_tool_result(
-        "check_return_eligibility",
-        {"order_id": order_id, "item_id": ebook_item},
-        ineligible,
-        bruce,
-        adopt_active_item=False,
-    )
+    for order in ((physical_item, ebook_item), (ebook_item, physical_item)):
+        bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+        outcomes = {item_id: check(bruce, item_id) for item_id in order}
+        reconcile_eligibility_batch(
+            bruce,
+            [(order_id, item_id, outcomes[item_id].payload) for item_id in order],
+        )
 
-    # The ebook's own refusal is not lost...
-    assert ineligible.payload.eligible is False
-    # ...but the paperback's grant, from earlier in the same turn, survives.
-    assert bruce.pending_return is not None
-    assert bruce.pending_return.item_id == physical_item
-    assert bruce.eligibility_token == token_after_first_check
+        assert outcomes[ebook_item].payload.eligible is False
+        assert len(bruce.pending_returns) == 1
+        assert bruce.pending_returns[0].item_id == physical_item
+        assert bruce.pending_returns[0].eligibility_token == (
+            outcomes[physical_item].payload.eligibility_token
+        )
 
-    # And the surviving token actually spends: this is the return that was
-    # wrongly blocked in the session that surfaced the bug.
-    bruce.confirmed = True
+
+def test_the_surviving_grant_from_a_batch_actually_spends(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """The pending return a batch reconciliation leaves behind is not just a
+    session field — its token is real and opens the return. This is the exact
+    write that was wrongly blocked in the session that surfaced the bug."""
+    order_id, physical_item, ebook_item = "ORD-1003", "ITEM-102", "ITEM-201"
+    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+
+    decisions = []
+    for item_id in (physical_item, ebook_item):
+        outcome = invoke_tool(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, bruce, now=now
+        )
+        apply_tool_result(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, bruce
+        )
+        decisions.append((order_id, item_id, outcome.payload))
+    reconcile_eligibility_batch(bruce, decisions)
+
+    bruce.pending_returns[0].confirmed = True
     opened = invoke_tool(
         "initiate_return", {"order_id": order_id, "item_id": physical_item}, bruce, now=now
     )
     assert opened.status is ToolStatus.OK
     assert opened.payload.created is True
+
+
+def test_two_eligible_items_in_one_batch_both_stay_pending_but_unconfirmed(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """Case C: two eligible candidates in the same turn are both real candidates.
+
+    CUST-004 owns two physical books, both currently inside their windows —
+    ORD-1006 by a holiday extension, ORD-1008 by the standard 30 days. Checking
+    both in one turn used to erase both, on the theory that a "yes" afterwards
+    would not say which book it means — but that collapsed two real candidates
+    to nothing, which is wrong: a customer who goes on to say "both" needs both
+    of them still on file, each with its own token. So both are kept pending,
+    each unconfirmed, and it is confirmation — not eligibility — that decides
+    which of them a later "yes" actually authorises.
+    """
+    order_a, item_a = "ORD-1006", "ITEM-103"
+    order_b, item_b = "ORD-1008", "ITEM-101"
+    dede = SessionState(verified_customer_id="CUST-004", customer_region="AU")
+
+    decisions = []
+    for order_id, item_id in ((order_a, item_a), (order_b, item_b)):
+        outcome = invoke_tool(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, dede, now=now
+        )
+        apply_tool_result(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, dede
+        )
+        assert outcome.payload.eligible is True
+        decisions.append((order_id, item_id, outcome.payload))
+
+    reconcile_eligibility_batch(dede, decisions)
+
+    assert len(dede.pending_returns) == 2
+    assert {(p.order_id, p.item_id) for p in dede.pending_returns} == {
+        (order_a, item_a),
+        (order_b, item_b),
+    }
+    assert not any(p.confirmed for p in dede.pending_returns)
+    assert dede.may_mutate is False
+
+
+def test_zero_eligible_items_in_one_batch_leave_nothing_pending(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """Case A: every candidate checked in the turn is ineligible, for different
+    reasons — the ebook can never be returned, and ORD-1007's book already has
+    an open return. Neither one has anything for a "yes" to act on."""
+    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+    checks = [("ORD-1003", "ITEM-201"), ("ORD-1007", "ITEM-100")]
+
+    decisions = []
+    for order_id, item_id in checks:
+        outcome = invoke_tool(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, bruce, now=now
+        )
+        apply_tool_result(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, bruce
+        )
+        assert outcome.payload.eligible is False
+        decisions.append((order_id, item_id, outcome.payload))
+
+    reconcile_eligibility_batch(bruce, decisions)
+
+    assert bruce.pending_returns == []
+    assert bruce.may_mutate is False
 
 
 def test_checking_a_different_item_on_its_own_turn_still_clears_the_old_one(
@@ -668,7 +738,8 @@ def test_checking_a_different_item_on_its_own_turn_still_clears_the_old_one(
         eligible,
         bruce,
     )
-    assert bruce.pending_return is not None
+    reconcile_eligibility_batch(bruce, [(order_id, physical_item, eligible.payload)])
+    assert len(bruce.pending_returns) == 1
 
     ineligible = invoke_tool(
         "check_return_eligibility", {"order_id": order_id, "item_id": ebook_item}, bruce, now=now
@@ -679,9 +750,87 @@ def test_checking_a_different_item_on_its_own_turn_still_clears_the_old_one(
         ineligible,
         bruce,
     )
+    reconcile_eligibility_batch(bruce, [(order_id, ebook_item, ineligible.payload)])
 
-    assert bruce.pending_return is None
-    assert bruce.eligibility_token is None
+    assert bruce.pending_returns == []
+
+
+def test_verifying_a_different_customer_clears_the_previous_ones_pending_state(
+    seeded_graph, now: datetime
+) -> None:
+    """A token, a confirmation, or an order list minted for one customer must not
+    survive a switch to another — the exact channel a return could otherwise
+    leak across accounts."""
+    order_id, item_id = "ORD-1003", "ITEM-102"
+    state = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+
+    outcome = invoke_tool(
+        "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, state, now=now
+    )
+    apply_tool_result(
+        "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, state
+    )
+    reconcile_eligibility_batch(state, [(order_id, item_id, outcome.payload)])
+    state.pending_returns[0].confirmed = True
+    state.active_order_ids = ["ORD-1003", "ORD-1007"]
+    assert state.may_mutate is True
+
+    kenji = invoke_tool("verify_identity", {"email": "kenji@example.com"}, state)
+    apply_tool_result("verify_identity", {}, kenji, state)
+
+    assert state.verified_customer_id == "CUST-004"
+    assert state.pending_returns == []
+    assert state.active_order_ids == []
+    assert state.active_order_id is None
+    assert state.active_item_id is None
+    assert state.may_mutate is False
+
+
+def test_initiate_return_is_idempotent_per_item_with_two_pending(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """Two returns pending; one gets written twice. Idempotency is item-specific
+    at the tool level — the second call for item_a reports the existing RMA
+    rather than a duplicate — and item_b's still-pending return, untouched by
+    either call, opens normally afterwards."""
+    order_a, item_a = "ORD-1006", "ITEM-103"
+    order_b, item_b = "ORD-1008", "ITEM-101"
+    dede = SessionState(verified_customer_id="CUST-004", customer_region="AU")
+
+    decisions = []
+    for order_id, item_id in ((order_a, item_a), (order_b, item_b)):
+        outcome = invoke_tool(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, dede, now=now
+        )
+        apply_tool_result(
+            "check_return_eligibility", {"order_id": order_id, "item_id": item_id}, outcome, dede
+        )
+        decisions.append((order_id, item_id, outcome.payload))
+    reconcile_eligibility_batch(dede, decisions)
+    token_a = next(p.eligibility_token for p in dede.pending_returns if p.item_id == item_a)
+    for pending in dede.pending_returns:
+        pending.confirmed = True
+
+    first = initiate_return(order_a, item_a, "CUST-004", "changed my mind", token_a, True)
+    apply_tool_result("initiate_return", {"order_id": order_a, "item_id": item_a},
+                       ToolOutcome(status=ToolStatus.OK, content="", summary="", payload=first),
+                       dede)
+    assert first.created is True
+    # item_a is consumed; item_b is untouched, still pending and still confirmed.
+    assert len(dede.pending_returns) == 1
+    assert dede.pending_returns[0].item_id == item_b
+    assert dede.pending_returns[0].confirmed is True
+
+    # The same request again, with the same (still valid) token — the RMA
+    # already exists, so this reports it back rather than writing a second one.
+    repeat = initiate_return(order_a, item_a, "CUST-004", "changed my mind", token_a, True)
+    assert repeat.created is False
+    assert repeat.return_record.return_id == first.return_record.return_id
+
+    second = invoke_tool("initiate_return", {"order_id": order_b, "item_id": item_b}, dede, now=now)
+    apply_tool_result("initiate_return", {"order_id": order_b, "item_id": item_b}, second, dede)
+    assert second.payload.created is True
+    assert dede.pending_returns == []
 
 
 # --- The mock data ------------------------------------------------------

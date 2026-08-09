@@ -493,6 +493,7 @@ def render_developer_state(state: SessionState) -> None:
     """
     with st.expander(DEVELOPER_LABEL, expanded=False):
         eligibility = state.eligibility
+        confirmed_count = sum(1 for pending in state.pending_returns if pending.confirmed)
         rows = {
             "Session": state.session_id,
             "Verified customer": state.verified_customer_id or "—",
@@ -505,11 +506,10 @@ def render_developer_state(state: SessionState) -> None:
                 if eligibility
                 else "—"
             ),
-            # Whether a token is held, never the token. The value is a credential;
-            # its presence is the interesting part.
-            "Eligibility token": "held" if state.eligibility_token else "none",
-            "Awaiting confirmation": _yes_no(state.pending_return is not None),
-            "Confirmed": _yes_no(state.confirmed),
+            # Counts, never the tokens — a session can hold more than one pending
+            # return, each with its own, and the value itself is a credential.
+            "Pending returns": str(len(state.pending_returns)),
+            "Confirmed returns": str(confirmed_count),
             "Escalated": _yes_no(state.escalated),
             "May mutate": _yes_no(state.may_mutate),
             "Tool calls": str(len(state.tool_traces)),

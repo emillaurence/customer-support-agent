@@ -69,7 +69,9 @@ __all__ = [
     "escalate_to_human",
     "initiate_return",
     "invoke_tool",
+    "item_title",
     "lookup_order",
+    "reconcile_eligibility_batch",
     "reset_demo",
     "search_policy",
     "verify_identity",
@@ -409,6 +411,17 @@ def _order_summaries(customer_id: str) -> list[OrderSummary]:
 def active_order_ids(customer_id: str) -> list[str]:
     """The ids of the customer's live orders, most recently placed first."""
     return [summary.order_id for summary in _order_summaries(customer_id)]
+
+
+def item_title(item_id: str) -> str | None:
+    """The catalogue title for one item, or None if it is not in it.
+
+    Used to work out which pending return(s) a confirmation question actually
+    named — never to decide eligibility or a policy, which stay item ids and
+    tools all the way through.
+    """
+    item = _load_items().get(item_id)
+    return item.title if item is not None else None
 
 
 def _item_on_order(order: Order, item_id: str) -> bool:
@@ -1173,19 +1186,41 @@ def _handle_check_return_eligibility(args: dict, state: SessionState, now) -> To
     )
 
 
+def _find_pending_return(
+    state: SessionState, order_id: str, item_id: str
+) -> PendingReturn | None:
+    """The trusted pending return for this exact customer, order, and item, if
+    one exists. Never another item's — a token or a confirmation earned for one
+    return must not authorise a different one."""
+    return next(
+        (
+            pending
+            for pending in state.pending_returns
+            if pending.customer_id == state.verified_customer_id
+            and pending.order_id == order_id
+            and pending.item_id == item_id
+        ),
+        None,
+    )
+
+
 def _handle_initiate_return(args: dict, state: SessionState, now) -> ToolOutcome:
-    # The three arguments the model does not get to supply, read from state at the
-    # moment of the call — so a token cleared by an item switch is gone, and a
-    # confirmation the customer never gave is False.
+    order_id, item_id = args["order_id"], args["item_id"]
+    # The token and the confirmation are never the model's to supply. Both come
+    # from the one pending return that matches this exact order and item — not
+    # from whichever pending return happens to be on the session — so a switch to
+    # a different item, or a confirmation that answered a different question,
+    # cannot be spent here.
+    pending = _find_pending_return(state, order_id, item_id)
     used = {
-        "order_id": args["order_id"],
-        "item_id": args["item_id"],
+        "order_id": order_id,
+        "item_id": item_id,
         "customer_id": state.verified_customer_id,
         # The reason is not a gate, so it must not be able to stop a confirmed
         # return: fall back to what the session recorded, and to nothing at all.
         "reason": args.get("reason") or state.return_reason or "",
-        "eligibility_token": state.eligibility_token or "",
-        "confirmed": state.confirmed,
+        "eligibility_token": pending.eligibility_token if pending else "",
+        "confirmed": bool(pending and pending.confirmed),
     }
     result = initiate_return(**used)
     # Whether a return was opened or already existed, its reference, and where it
@@ -1231,7 +1266,6 @@ def apply_tool_result(
     state: SessionState,
     *,
     adopt_active_order: bool = True,
-    adopt_active_item: bool = True,
 ) -> None:
     """Update session state from a tool result — and only from a tool result.
 
@@ -1241,15 +1275,15 @@ def apply_tool_result(
     believe this?" short: a tool said so. Nothing here trusts the model's
     arguments on their own.
 
+    `check_return_eligibility` is the one exception: a single call must not
+    decide the pending return on its own, because one turn can check several
+    items and the last one to run must not simply win. See
+    `reconcile_eligibility_batch`, run once per turn after every check in it.
+
     Args:
         adopt_active_order: Whether a successful `lookup_order` may make its order
             the one under discussion. False when the same turn read several orders
             — that is the agent browsing to build a question, not selecting.
-        adopt_active_item: Whether a successful `check_return_eligibility` may
-            replace the item under discussion. False when the same turn checks
-            several items — that is the agent comparing them, not the customer
-            abandoning whichever was already found eligible, so an existing
-            pending return and its token are left alone rather than cleared.
     """
     if outcome.status is not ToolStatus.OK or outcome.payload is None:
         return
@@ -1257,6 +1291,11 @@ def apply_tool_result(
     payload = outcome.payload
 
     if name == "verify_identity" and payload.verified:
+        if state.verified_customer_id and state.verified_customer_id != payload.customer_id:
+            # A different customer has verified mid-session. Nothing scoped to the
+            # last one — a pending return, its token, its confirmation — may
+            # survive the switch.
+            state.clear_account_context()
         state.verified_customer_id = payload.customer_id
         state.customer_region = payload.region
 
@@ -1275,49 +1314,26 @@ def apply_tool_result(
         state.active_order_id = payload.order.order_id
 
     elif name == "check_return_eligibility":
-        order_id = outcome.args_used["order_id"]
-        item_id = outcome.args_used["item_id"]
-        state.eligibility = payload
+        # Only the reason is recorded here. Whether this decision becomes the
+        # pending return is settled once per turn, by reconcile_eligibility_batch
+        # — not here, and not by whichever call happens to run last.
         if args.get("reason"):
             state.return_reason = args["reason"]
 
-        switching_item = (
-            state.active_item_id not in (None, item_id) or state.active_order_id != order_id
-        )
-
-        if switching_item and not adopt_active_item and state.pending_return is not None:
-            # The same turn is checking a second item while one is already
-            # pending — the agent comparing candidates, not the customer walking
-            # away from the first. Leave the existing pending return and its
-            # token exactly as they were; this call gets no say over them.
-            return
-
-        # A new item means the old attempt is over. Clearing first drops the
-        # previous token, decision, and any confirmation, so nothing from the
-        # last item can be spent on this one.
-        if switching_item:
-            state.clear_return_context()
-            state.eligibility = payload  # clear_return_context just wiped this
-
-        state.active_order_id = order_id
-        state.active_item_id = item_id
-        state.eligibility_token = payload.eligibility_token
-
-        if payload.eligible and payload.eligibility_token:
-            # There is now something a "yes" could authorise. It does not count
-            # until the agent has actually asked.
-            state.pending_return = PendingReturn(
-                order_id=order_id, item_id=item_id, eligibility_token=payload.eligibility_token
-            )
-        else:
-            state.pending_return = None
-            state.confirmed = False
-
     elif name == "initiate_return":
         # Done either way: `created=False` means a return already existed, and the
-        # customer's request is satisfied. Clearing stops a second "yes" later in
-        # the conversation from meaning anything.
-        state.clear_return_context()
+        # customer's request is satisfied. Only *this* item's pending return is
+        # consumed — a session can hold others, still confirmed and still
+        # spendable, and they must not be swept away by this one's success. Only
+        # once none are left does the broader workflow clear.
+        order_id, item_id = args.get("order_id"), args.get("item_id")
+        state.pending_returns = [
+            pending
+            for pending in state.pending_returns
+            if (pending.order_id, pending.item_id) != (order_id, item_id)
+        ]
+        if not state.pending_returns:
+            state.clear_return_context()
 
     elif name == "escalate_to_human" and getattr(payload, "case_id", None):
         # Escalation follows a case that was actually created, and nothing else —
@@ -1325,6 +1341,66 @@ def apply_tool_result(
         # router picked, and not the agent merely *offering* to pass the customer
         # on. The case id is the evidence.
         state.escalated = True
+
+
+def reconcile_eligibility_batch(
+    state: SessionState, batch: list[tuple[str, str, EligibilityDecision]]
+) -> None:
+    """Decide which returns, if any, a turn's eligibility checks leave pending.
+
+    Called once per turn, after every `check_return_eligibility` call in it has
+    run — never from inside a single call, so which one happened to run first or
+    last cannot decide the outcome. `batch` holds `(order_id, item_id, decision)`
+    for each call that actually succeeded this turn, in call order. This turn's
+    checks replace whatever was pending before: checking a different item is the
+    customer moving on, and a token or a confirmation earned for the old one must
+    not survive the move (see `clear_return_context`, which this achieves by
+    always starting `pending_returns` over).
+
+    Zero eligible candidates: nothing is pending. One or more: every eligible one
+    becomes a pending return, each with its own token — a second, ineligible
+    candidate in the same batch (an ebook checked alongside the paperback that
+    grants it) must not erase the others, and neither must a second *eligible*
+    one: two eligible books checked together are two candidates, not zero. None
+    of them start confirmed, since nothing has been asked about them yet — that
+    is for the loop's confirmation handling, which targets exactly the return(s)
+    a question was actually about.
+    """
+    if not batch:
+        return
+
+    eligible = [
+        (order_id, item_id, decision)
+        for order_id, item_id, decision in batch
+        if decision.eligible and decision.eligibility_token
+    ]
+
+    state.eligibility = batch[-1][2]
+    state.pending_returns = [
+        PendingReturn(
+            customer_id=state.verified_customer_id or "",
+            order_id=order_id,
+            item_id=item_id,
+            eligibility_token=decision.eligibility_token,
+        )
+        for order_id, item_id, decision in eligible
+    ]
+
+    if len(eligible) == 1:
+        order_id, item_id, _decision = eligible[0]
+        state.active_order_id = order_id
+        state.active_item_id = item_id
+    elif len(batch) == 1:
+        # One item was checked and refused. Still name what was checked, so the
+        # conversation can keep referring to it.
+        order_id, item_id, _ = batch[0]
+        state.active_order_id = order_id
+        state.active_item_id = item_id
+    else:
+        # Several were checked. Zero eligible, or more than one, leaves no single
+        # item to point at as "the" one under discussion.
+        state.active_order_id = None
+        state.active_item_id = None
 
 
 # --- Putting the demo back ----------------------------------------------
