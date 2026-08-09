@@ -2,8 +2,8 @@
 
     pytest -m integration
 
-Everything else in the suite stubs the graph from `neo4j/policy_graph.json`. These
-tests take no stub: they open a driver, run the actual Cypher, and re-check the
+Everything else in the suite stubs the graph from `neo4j/policy_graph.json`.
+These take no stub: they open a driver, run the actual Cypher, and re-check the
 decisions that matter against what is really in the database. That is what makes
 the stub trustworthy — if the ingested graph and the seed file ever diverge, the
 unit tests keep passing and these stop.
@@ -18,8 +18,9 @@ from datetime import datetime
 
 import pytest
 
-from agent.graph import PolicyGraphUnavailableError, fetch_policies_for_category, get_driver
-from tools import check_return_eligibility, search_policy
+from agent.tools import check_return_eligibility
+from policy.graph import PolicyGraphUnavailableError, fetch_policies_for_category, get_driver
+from policy.policy import Policy, PolicyContext, applicable_policies, search_policy
 
 pytestmark = pytest.mark.integration
 
@@ -28,9 +29,9 @@ pytestmark = pytest.mark.integration
 def live_graph() -> None:
     """Skip the module unless a seeded database answers.
 
-    Checks that policies are actually present, not just that the server is up —
-    an empty database would otherwise produce confusing no-match failures rather
-    than an honest "run the ingest script".
+    Checks that policies are actually present, not just that the server is up — an
+    empty database would otherwise produce confusing no-match failures rather than
+    an honest "run the ingest script".
     """
     try:
         driver = get_driver()
@@ -49,17 +50,13 @@ def test_physical_book_policies_come_back_from_the_database() -> None:
     rows = fetch_policies_for_category("PhysicalBook")
     ids = [row["policy"]["policy_id"] for row in rows]
     assert set(ids) == {
-        "STANDARD_30_DAY",
-        "HOLIDAY_EXTENDED_RETURN",
-        "AU_BOOKLY_EXTENDED_RETURN",
+        "STANDARD_30_DAY", "HOLIDAY_EXTENDED_RETURN", "AU_BOOKLY_EXTENDED_RETURN"
     }
     # Ordered by precedence, which is what eligibility ranks on.
     assert ids[0] == "AU_BOOKLY_EXTENDED_RETURN"
 
 
 def test_ebook_category_has_only_the_digital_policy() -> None:
-    from agent.models import Policy
-
     rows = fetch_policies_for_category("EBook")
     assert [row["policy"]["policy_id"] for row in rows] == ["DIGITAL_NO_RETURN"]
     # Neo4j does not store null properties, so `window_days` is absent from the
@@ -89,8 +86,6 @@ def test_unknown_category_returns_nothing_rather_than_erroring() -> None:
 
 def test_promotional_dates_parse_off_the_database() -> None:
     """Read back as dates, since eligibility compares them to an order date."""
-    from agent.models import Policy
-
     rows = fetch_policies_for_category("PhysicalBook")
     holiday = next(r for r in rows if r["policy"]["policy_id"] == "HOLIDAY_EXTENDED_RETURN")
     policy = Policy.model_validate(holiday["policy"])
@@ -141,12 +136,7 @@ def test_search_no_match_live() -> None:
     ],
 )
 def test_eligibility_against_the_live_graph(
-    order_id: str,
-    item_id: str,
-    customer_id: str,
-    eligible: bool,
-    policy_id: str,
-    now: datetime,
+    order_id: str, item_id: str, customer_id: str, eligible: bool, policy_id: str, now: datetime
 ) -> None:
     """The same six scenarios the unit tests cover, decided by the real database."""
     decision = check_return_eligibility(order_id, item_id, customer_id, now=now)
@@ -155,13 +145,20 @@ def test_eligibility_against_the_live_graph(
 
 
 def test_non_au_customer_never_gets_the_au_policy_live() -> None:
-    """The precedence trap, against real data: AU is precedence 10, and unreachable from GB."""
-    from tools.check_return_eligibility import applicable_policies
-    from tools.fixtures import load_orders
+    """The precedence trap, against real data: AU is precedence 10, unreachable from GB."""
+    from agent.tools import _load_orders
 
-    order = next(o for o in load_orders() if o.order_id == "ORD-1002")
-    gb = [policy.policy_id for policy, _, _ in applicable_policies("PhysicalBook", order, "GB")]
-    au = [policy.policy_id for policy, _, _ in applicable_policies("PhysicalBook", order, "AU")]
+    order = next(o for o in _load_orders() if o.order_id == "ORD-1002")
+    context = {"promotion_code": order.promotion_code, "placed_at": order.placed_at}
+
+    gb = [
+        c.policy.policy_id
+        for c in applicable_policies("PhysicalBook", PolicyContext(region="GB", **context))
+    ]
+    au = [
+        c.policy.policy_id
+        for c in applicable_policies("PhysicalBook", PolicyContext(region="AU", **context))
+    ]
 
     assert "AU_BOOKLY_EXTENDED_RETURN" not in gb
     assert "AU_BOOKLY_EXTENDED_RETURN" in au
@@ -170,9 +167,8 @@ def test_non_au_customer_never_gets_the_au_policy_live() -> None:
 def test_informational_and_eligibility_agree_on_australia_live(now: datetime) -> None:
     """The Australia regression, against the real database rather than the stub.
 
-    The informational answer and the decision are selected by the same mechanism,
-    so if they ever disagree about which policy governs an AU physical book, they
-    disagree here first.
+    Both are selected by the same mechanism, so if they ever disagree about which
+    policy governs an AU physical book, they disagree here first.
     """
     informational = search_policy(
         "what is the return policy for Australian customers?", product_type="PhysicalBook"

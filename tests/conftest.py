@@ -1,6 +1,7 @@
-"""Shared test fixtures.
+"""Shared fixtures: a fixed clock, a throwaway copy of the data, an offline
+policy graph, and a stand-in for Anthropic.
 
-Two things make the tool tests deterministic:
+Four things make the suite deterministic and offline:
 
 * **A fixed clock.** The order fixtures are written relative to 2026-08-08 —
   "day 11", "day 34", "day 67". The tools default to `datetime.now(UTC)`, and
@@ -9,24 +10,20 @@ Two things make the tool tests deterministic:
 * **A copy of the data.** `data_dir` redirects the tools at a temporary copy of
   `data/`, so `initiate_return` can be tested for real without a passing test run
   leaving an RMA in the repo.
-
-For the Phase 4 agent tests there is a third: **a stand-in for Anthropic.**
-`FakeAnthropic` replays a script of responses instead of calling the API, so the
-tool loop, the routing, the confirmation gate, and the tracing are all exercised
-end to end with no network, no key, and no model non-determinism. What is being
-tested is the orchestrator's behaviour given a model's output — not the model.
-
-`seeded_graph` is the offline stand-in for Neo4j. It answers the one policy query
-the tools make, built from `neo4j/policy_graph.json` — the same seed that was
-ingested into the database — so unit tests exercise the real decision logic
-without a database. `tests/test_neo4j_integration.py` runs the same cases against
-the live graph, which is what proves the stub is honest.
+* **`seeded_graph`.** The offline stand-in for Neo4j, built from
+  `neo4j/policy_graph.json` — the same seed that was ingested — so unit tests
+  exercise the real decision logic without a database.
+  `tests/test_neo4j_integration.py` runs the same cases against the live graph,
+  which is what proves the stub is honest.
+* **`FakeAnthropic`.** Replays a script of responses instead of calling the API,
+  so the tool loop, the routing, the confirmation gate, and the tracing are all
+  exercised with no network, no key, and no model non-determinism. What is under
+  test is the agent's behaviour given a model's output — not the model.
 """
 
 from __future__ import annotations
 
 import copy
-import importlib
 import json
 import shutil
 from dataclasses import dataclass
@@ -37,8 +34,7 @@ from typing import Any
 
 import pytest
 
-from agent.config import AnthropicConfig
-from agent.orchestrator import BooklyAgent
+from agent.agent import AnthropicConfig, BooklyAgent
 from agent.state import SessionState
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +42,24 @@ POLICY_SEED = ROOT / "neo4j" / "policy_graph.json"
 
 FIXED_NOW = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 """The date the order fixtures are written against."""
+
+# --- The demo customer ---------------------------------------------------
+#
+# Ada (CUST-001) has two live orders: ORD-1001 holds a physical book delivered 11
+# days before the fixed clock, ORD-1002 one delivered 67 days before it. The
+# first is the hero return; the second is the outside-the-window case. Both come
+# out of the fixtures — no test tells a tool what to decide.
+
+HERO_EMAIL = "ada@example.com"
+HERO_CUSTOMER = "CUST-001"
+IN_WINDOW_ORDER, IN_WINDOW_ITEM = "ORD-1001", "ITEM-100"
+EXPIRED_ORDER, EXPIRED_ITEM = "ORD-1002", "ITEM-101"
+
+CONFIRM_QUESTION = (
+    "That one can be returned. Shall I start a return for The Pragmatic Programmer "
+    "on order ORD-1001?"
+)
+"""A cue plus a question mark, which is what `asks_for_confirmation` looks for."""
 
 
 @pytest.fixture
@@ -61,12 +75,12 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     Autouse: no test should be able to write to the repo's fixtures, and a test
     that mutates returns.json must not change what the next test reads.
     """
-    from tools import fixtures
+    from agent import tools
 
-    copy = tmp_path / "data"
-    shutil.copytree(ROOT / "data", copy)
-    monkeypatch.setattr(fixtures, "DATA_DIR", copy)
-    return copy
+    copied = tmp_path / "data"
+    shutil.copytree(ROOT / "data", copied)
+    monkeypatch.setattr(tools, "DATA_DIR", copied)
+    return copied
 
 
 @pytest.fixture(autouse=True)
@@ -76,18 +90,19 @@ def clean_tokens():
     The store is process-global, so a token minted by one test would otherwise be
     spendable in another — exactly the confusion the store exists to prevent.
     """
-    from tools import eligibility_tokens
+    from agent.tools import _clear_eligibility_tokens
 
-    eligibility_tokens.clear()
+    _clear_eligibility_tokens()
     yield
-    eligibility_tokens.clear()
+    _clear_eligibility_tokens()
+
+
+def returns_in(data_dir: Path) -> list[dict]:
+    """Every RMA currently on disk, read from the test's temporary data copy."""
+    return json.loads((data_dir / "returns.json").read_text())
 
 
 # --- Offline policy graph -----------------------------------------------
-
-
-def _seed() -> dict[str, Any]:
-    return json.loads(POLICY_SEED.read_text())
 
 
 def policy_rows_for_category(product_type: str) -> list[dict[str, Any]]:
@@ -96,14 +111,8 @@ def policy_rows_for_category(product_type: str) -> list[dict[str, Any]]:
     Same shape as the Cypher result: the policy's properties, the regions with a
     HAS_OVERRIDE edge to it, and the policy ids it OVERRIDES, ordered by
     precedence descending.
-
-    Args:
-        product_type: A category name.
-
-    Returns:
-        One row per policy governing that category.
     """
-    seed = _seed()
+    seed = json.loads(POLICY_SEED.read_text())
     policies = {policy["policy_id"]: policy for policy in seed["policies"]}
     relationships = seed["relationships"]
 
@@ -119,9 +128,7 @@ def policy_rows_for_category(product_type: str) -> list[dict[str, Any]]:
             # Nulls dropped, because Neo4j does not store null properties: a row
             # off the real graph has the key missing, not set to None. Matching
             # that keeps the stub honest about the shape the tools handle.
-            "policy": {
-                key: value for key, value in policies[policy_id].items() if value is not None
-            },
+            "policy": {k: v for k, v in policies[policy_id].items() if v is not None},
             "granted_to_regions": [
                 rel["from"]
                 for rel in relationships
@@ -139,18 +146,16 @@ def policy_rows_for_category(product_type: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _policy_reading_modules() -> list[Any]:
-    """The modules holding a reference to `fetch_policies_for_category`.
+@pytest.fixture
+def seeded_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer policy queries from the seed file instead of Neo4j.
 
-    One, now: `tools.policy_rules` is the single read of the policy graph, and
-    both policy tools go through it. Patching there covers both, and a tool that
-    grew its own graph read would no longer be stubbed — which is the point.
-
-    Fetched from `sys.modules` by name. `tools/__init__` re-exports each tool
-    *function* under its module's name, so `tools.search_policy` is the function
-    and a plain `import ... as` would hand back the wrong object.
+    Patched on `policy.policy`, which is the single read of the graph, so both
+    policy tools are covered and a tool that grew its own read would not be
+    stubbed. Requested explicitly rather than autouse — the integration tests must
+    not get it.
     """
-    return [importlib.import_module("tools.policy_rules")]
+    monkeypatch.setattr("policy.policy.fetch_policies_for_category", policy_rows_for_category)
 
 
 def break_policy_graph(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,17 +163,13 @@ def break_policy_graph(monkeypatch: pytest.MonkeyPatch) -> None:
 
     A plain function rather than a fixture, so a test can call it after
     `seeded_graph` has been applied and be sure it wins.
-
-    Args:
-        monkeypatch: The calling test's monkeypatch.
     """
-    from agent.graph import PolicyGraphUnavailableError
+    from policy.graph import PolicyGraphUnavailableError
 
     def unavailable(_product_type: str):
         raise PolicyGraphUnavailableError("cannot reach Neo4j at bolt://localhost:7687")
 
-    for module in _policy_reading_modules():
-        monkeypatch.setattr(module, "fetch_policies_for_category", unavailable)
+    monkeypatch.setattr("policy.policy.fetch_policies_for_category", unavailable)
 
 
 # --- Offline Anthropic ---------------------------------------------------
@@ -176,12 +177,11 @@ def break_policy_graph(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @dataclass
 class FakeBlock:
-    """One content block, with just the fields the orchestrator reads.
+    """One content block, with just the fields the loop reads.
 
-    Deliberately not an SDK type. The orchestrator reads blocks by attribute
-    rather than by class, so a plain object is enough — and building responses
-    by hand is what lets a test say "the model asked for verify_identity, then
-    replied" without a network call.
+    Deliberately not an SDK type. The loop reads blocks by attribute rather than
+    by class, so a plain object is enough — and building responses by hand is what
+    lets a test say "the model asked for verify_identity, then replied".
     """
 
     type: str
@@ -192,10 +192,29 @@ class FakeBlock:
 
 
 @dataclass
+class FakeUsage:
+    """The prompt-cache counters off a real response's `usage`.
+
+    Only the two fields the loop reads. A real `usage` carries more, and reports
+    None rather than zero when a model or account has no cache activity — which
+    is why the loop reads it defensively.
+    """
+
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+
+
+@dataclass
 class FakeResponse:
-    """One Anthropic response: a list of content blocks."""
+    """One Anthropic response: a list of content blocks, and optionally usage.
+
+    `usage` defaults to None because most tests are about the loop's behaviour,
+    not its accounting — and its absence also exercises the path where a response
+    reports no usage at all.
+    """
 
     content: list[FakeBlock]
+    usage: FakeUsage | None = None
 
 
 def text(body: str) -> FakeResponse:
@@ -203,7 +222,9 @@ def text(body: str) -> FakeResponse:
     return FakeResponse(content=[FakeBlock(type="text", text=body)])
 
 
-def tool_call(name: str, tool_input: dict[str, Any], block_id: str = "toolu_1", say: str = "") -> FakeResponse:
+def tool_call(
+    name: str, tool_input: dict[str, Any], block_id: str = "toolu_1", say: str = ""
+) -> FakeResponse:
     """A response asking for one tool, optionally with a line of text first."""
     blocks = [FakeBlock(type="text", text=say)] if say else []
     blocks.append(FakeBlock(type="tool_use", id=block_id, name=name, input=tool_input))
@@ -231,17 +252,15 @@ class FakeMessages:
     def create(self, **kwargs: Any) -> FakeResponse:
         """Record the request and return the next scripted response.
 
-        The request is deep-copied before it is recorded. The orchestrator hands
-        its live transcript straight to the client, so holding a reference would
-        mean every recorded call aliased the same growing list and a test could
-        only ever inspect the final state.
+        The request is deep-copied because the loop hands its live transcript
+        straight to the client: holding a reference would mean every recorded call
+        aliased the same growing list.
 
         Raises:
             Exception: The configured error, if one was given — this is how the
                 API-unavailable path is tested.
             AssertionError: If the loop asked for more responses than the script
-                holds, which means the orchestrator looped further than the test
-                expected.
+                holds, which means it looped further than the test expected.
         """
         self.calls.append(copy.deepcopy(kwargs))
         if self._error is not None:
@@ -251,11 +270,7 @@ class FakeMessages:
 
 
 class FakeAnthropic:
-    """A stand-in Anthropic client that replays a script.
-
-    Exposes the one method the orchestrator uses, plus the recorded calls so a
-    test can assert on which model was used and what was sent.
-    """
+    """A stand-in Anthropic client that replays a script."""
 
     def __init__(self, *responses: FakeResponse, error: Exception | None = None) -> None:
         self.messages = FakeMessages(list(responses), error)
@@ -275,9 +290,8 @@ class FakeAnthropic:
 def anthropic_config() -> AnthropicConfig:
     """Configuration with recognisable placeholder model names.
 
-    Not real model ids: the point is that the orchestrator uses whatever the
-    environment gave it, so the test asserts on these strings rather than on any
-    particular Claude release.
+    Not real model ids: the point is that the agent uses whatever the environment
+    gave it, so tests assert on these strings rather than on any Claude release.
     """
     return AnthropicConfig(
         api_key="sk-ant-test-not-a-real-key",
@@ -290,7 +304,7 @@ def anthropic_config() -> AnthropicConfig:
 def make_agent(anthropic_config: AnthropicConfig):
     """Build a `BooklyAgent` wired to a scripted client and the fixed clock."""
 
-    def build(*responses: FakeResponse, error: Exception | None = None) -> tuple[Any, FakeAnthropic]:
+    def build(*responses: FakeResponse, error: Exception | None = None):
         client = FakeAnthropic(*responses, error=error)
         agent = BooklyAgent(config=anthropic_config, client=client, clock=FIXED_NOW)
         return agent, client
@@ -298,28 +312,96 @@ def make_agent(anthropic_config: AnthropicConfig):
     return build
 
 
+# --- Sessions ------------------------------------------------------------
+
+
 @pytest.fixture
 def verified_state() -> SessionState:
-    """A session where CUST-001 has already been verified.
+    """A session where CUST-001 has already been verified, with one order chosen.
 
-    Saves every order test from replaying the identity turn. CUST-001 has one
-    active order, so nothing here is ambiguous.
+    Saves every order test from replaying the identity turn.
     """
     return SessionState(
-        verified_customer_id="CUST-001",
+        verified_customer_id=HERO_CUSTOMER,
         customer_region="GB",
-        active_order_ids=["ORD-1001"],
-        active_order_id="ORD-1001",
+        active_order_ids=[IN_WINDOW_ORDER],
+        active_order_id=IN_WINDOW_ORDER,
     )
 
 
 @pytest.fixture
-def seeded_graph(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Answer policy queries from the seed file instead of Neo4j.
+def hero_verified() -> SessionState:
+    """The hero customer, verified, with neither of her two orders chosen yet."""
+    return SessionState(
+        verified_customer_id=HERO_CUSTOMER,
+        customer_region="GB",
+        active_order_ids=[IN_WINDOW_ORDER, EXPIRED_ORDER],
+    )
 
-    Patched on the two tools that read the graph, at the name each of them
-    imported, so nothing reaches a driver. Requested explicitly rather than
-    autouse — the integration tests must not get it.
+
+# --- The hero conversation ----------------------------------------------
+
+
+@pytest.fixture
+def hero_script():
+    """Anthropic's side of the whole hero conversation, in order.
+
+    Five turns' worth of responses. The tool calls are the ones a model that read
+    the schemas would make; the text is what it would say around them.
     """
-    for module in _policy_reading_modules():
-        monkeypatch.setattr(module, "fetch_policies_for_category", policy_rows_for_category)
+    return (
+        # Turn 1 — unverified, so the only thing to do is ask.
+        text("Happy to check. What's the email address on your Bookly account?"),
+        # Turn 2 — verify, and ask straight away. `verify_identity` already names
+        # both orders and the books on them, so there is nothing to look up yet.
+        tool_call("verify_identity", {"email": HERO_EMAIL}),
+        text(
+            "Thanks Ada. You've got two orders with us — one with The Pragmatic "
+            "Programmer and one with Designing Data-Intensive Applications. Which "
+            "one did you mean?"
+        ),
+        # Turn 3 — the customer picks one by title; the agent opens that order.
+        tool_call("lookup_order", {"order_id": IN_WINDOW_ORDER}, block_id="toolu_pick"),
+        text("The Pragmatic Programmer was delivered on 28 July and is with you."),
+        # Turn 4 — intent changes; eligibility decides, and the agent asks.
+        tool_call(
+            "check_return_eligibility",
+            {
+                "order_id": IN_WINDOW_ORDER,
+                "item_id": IN_WINDOW_ITEM,
+                "reason": "Not what I expected.",
+            },
+            block_id="toolu_elig",
+        ),
+        text(CONFIRM_QUESTION),
+        # Turn 5 — confirmed, so the write happens.
+        tool_call(
+            "initiate_return",
+            {
+                "order_id": IN_WINDOW_ORDER,
+                "item_id": IN_WINDOW_ITEM,
+                "reason": "Not what I expected.",
+            },
+            block_id="toolu_write",
+        ),
+        text("Your return is open. You'll get an email with the next steps."),
+    )
+
+
+def run_hero_flow(agent, state: SessionState) -> None:
+    """Drive the five customer turns of the hero conversation."""
+    agent.respond(state, "Where's my book?")
+    agent.respond(state, HERO_EMAIL)
+    agent.respond(state, "The Pragmatic Programmer one")
+    agent.respond(state, "Actually, I want to return it.")
+    agent.respond(state, "Yes please")
+
+
+def tool_names(state: SessionState) -> list[str]:
+    """The tools this session has run, oldest first."""
+    return [trace.tool_name for trace in state.tool_traces]
+
+
+def tiers(state: SessionState) -> list[str]:
+    """The model tier chosen for each turn, oldest first."""
+    return [turn.model_tier for turn in state.model_turns]

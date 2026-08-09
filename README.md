@@ -22,13 +22,16 @@ JSON is used only for mock transactional data.**
 
 ```
 Customer
-  └── Streamlit UI
-        └── Bookly agent orchestrator
+  └── Streamlit UI                      app.py + ui.py
+        └── Bookly agent                agent/agent.py
               ├── model routing (deterministic)  → Haiku | Sonnet
               ├── Anthropic Messages API         → tool selection, language
-              └── tools (deterministic Python)
+              ├── trusted session state          agent/state.py
+              └── six tools (deterministic)      agent/tools.py
                     ├── JSON (mock data)  → customers, orders, items, returns
-                    └── Neo4j (required)  → policy rules and eligibility relationships
+                    └── policy layer      policy/policy.py + policy/graph.py
+                          └── Neo4j (required)  → policy rules, regional overrides,
+                                                  precedence, rule paths
 ```
 
 One agent, a flat set of tools, no framework and no second agent. The division
@@ -44,7 +47,7 @@ of labour is the point:
 | | The return write, and idempotency |
 
 Claude can *ask* for a tool. It cannot decide an answer, and it cannot write a
-trusted field. Every value a guard depends on is set by the orchestrator from a
+trusted field. Every value a guard depends on is set by the agent loop from a
 tool result that actually succeeded.
 
 Customer and order data live in flat JSON because it is simple record lookup. Policy lives in a
@@ -54,55 +57,48 @@ item category, in which region, during which promotion, and which override wins.
 Policy lookup, eligibility rules, policy overrides, regional overrides, and
 explainable rule paths are all decided by Cypher against Neo4j. There is no
 JSON policy engine and no bypass switch: if the graph is unreachable,
-[agent/graph.py](agent/graph.py) raises `PolicyGraphUnavailableError` and the
+[policy/graph.py](policy/graph.py) raises `PolicyGraphUnavailableError` and the
 tool fails. It never degrades to a fixture or returns a mocked decision.
 
 ## Layout
 
+Six files hold the whole system. Read them in this order.
+
 | Path | What it holds |
 | --- | --- |
-| [app.py](app.py) | The Streamlit chat shell — transcript in, one turn out |
-| [ui/format.py](ui/format.py) | Pure display helpers: latency, statuses, sanitized arguments, the rule path |
-| [ui/turns.py](ui/turns.py) | `AssistantTurn` — the mapping from the session's traces to the reply that caused them |
-| [ui/render.py](ui/render.py) | The Streamlit calls: chat, per-turn trace, developer state |
-| [ui/theme.py](ui/theme.py) | Bookly branding: copy, accent colour, and a short stylesheet |
+| [agent/agent.py](agent/agent.py) | **How the agent works.** Configuration, the system prompt, deterministic Haiku/Sonnet routing, the confirmation gate, and the Anthropic tool loop |
+| [agent/tools.py](agent/tools.py) | **What it can do.** The six tools, their schemas, the dispatch that injects trusted arguments, the trusted-state updates, and the mock-data and token helpers behind them |
+| [agent/state.py](agent/state.py) | **What it remembers.** `SessionState`, the domain records, and `ToolTrace` / `ModelTurn` with their sanitizing |
+| [policy/policy.py](policy/policy.py) | **Where business policy lives.** Region normalization, applicability, precedence, rule paths, and `search_policy` — the one selection both policy tools read |
+| [policy/graph.py](policy/graph.py) | The required Neo4j connection and the one policy query; raises when it is missing |
+| [ui.py](ui.py) | **How the demo is rendered.** Theme, trace formatting, trace-to-turn mapping, and the Streamlit calls |
+| [app.py](app.py) | The Streamlit entry point — transcript in, one turn out |
 | [.streamlit/config.toml](.streamlit/config.toml) | The palette, as Streamlit's own theming |
-| [agent/orchestrator.py](agent/orchestrator.py) | The Anthropic tool loop — one turn in, one reply out |
-| [agent/routing.py](agent/routing.py) | Deterministic Haiku/Sonnet selection |
-| [agent/tool_registry.py](agent/tool_registry.py) | Tool schemas, dispatch, and trusted-state updates |
-| [agent/confirmation.py](agent/confirmation.py) | Whether a "yes" authorises a specific return |
-| [agent/tracing.py](agent/tracing.py) | `ToolTrace` and `ModelTurn` — observable execution |
-| [agent/config.py](agent/config.py) | Anthropic configuration, validated at startup |
-| [agent/prompts.py](agent/prompts.py) | System prompt and guardrail list |
-| [agent/state.py](agent/state.py) | `SessionState` — the only thing carried between turns |
-| [agent/models.py](agent/models.py) | Typed domain models mirroring the fixtures |
-| [tools/](tools/) | The six tools, plus `fixtures.py` (mock data access) and `eligibility_tokens.py` (token store) |
-| [tools/policy_rules.py](tools/policy_rules.py) | The one policy-selection mechanism: region normalization, applicability, precedence, rule paths — shared by both policy tools |
-| [agent/graph.py](agent/graph.py) | The required Neo4j connection and the one policy query; raises when it is missing |
-| [agent/demo.py](agent/demo.py) | The one reset the script and the UI button share |
-| [scripts/reset_demo.py](scripts/reset_demo.py) | `python scripts/reset_demo.py` — the command line around it |
+| [scripts/reset_demo.py](scripts/reset_demo.py) | `python scripts/reset_demo.py` — the command line around `agent.tools.reset_demo` |
 | [data/](data/) | Mock transactional JSON only: customers, orders, items, returns |
 | [data/seed/](data/seed/) | Pristine copies of the mutable files, for the reset to restore |
 | [neo4j/](neo4j/) | Policy graph seed, ingestion script, reference Cypher |
-| [tests/](tests/) | Unit tests for all six tools, plus a live-Neo4j integration group |
+| [tests/](tests/) | Five suites by behaviour, plus a live-Neo4j integration group |
 
 ## Tools
 
+All six are in [agent/tools.py](agent/tools.py), in this order.
+
 | Tool | Purpose | Reads |
 | --- | --- | --- |
-| [verify_identity](tools/verify_identity.py) | Verify by email; returns `customer_id`, region, and active order ids | JSON |
-| [lookup_order](tools/lookup_order.py) | Fetch one owned order, its items, and its shipment | JSON |
-| [search_policy](tools/search_policy.py) | Informational policy retrieval — what the rules *are* | Neo4j |
-| [check_return_eligibility](tools/check_return_eligibility.py) | The deterministic decision for one item on one order | Neo4j + JSON |
-| [initiate_return](tools/initiate_return.py) | The only write. Needs a bound eligibility token *and* `confirmed=True` | JSON |
-| [escalate_to_human](tools/escalate_to_human.py) | Mint a case id and hand off | — |
+| `verify_identity` | Verify by email; returns `customer_id`, region, and active order ids | JSON |
+| `lookup_order` | Fetch one owned order, its items, and its shipment | JSON |
+| `search_policy` | Informational policy retrieval — what the rules *are* (body in [policy/policy.py](policy/policy.py)) | Neo4j |
+| `check_return_eligibility` | The deterministic decision for one item on one order | Neo4j + JSON |
+| `initiate_return` | The only write. Needs a bound eligibility token *and* `confirmed=True` | JSON |
+| `escalate_to_human` | Mint a case id and hand off | — |
 
 ### The schemas are narrower than the functions
 
 Each tool's Python signature takes everything it needs to be safe alone —
 `customer_id`, `eligibility_token`, `confirmed`. The JSON schema shown to Claude
 exposes only what the *customer* decides: which order, which item, why. The rest
-is injected by [agent/tool_registry.py](agent/tool_registry.py) from trusted
+is injected by [agent/tools.py](agent/tools.py) from trusted
 session state.
 
 That is the difference between a guard and a suggestion. If `confirmed` were a
@@ -120,7 +116,7 @@ issues a token.
 
 They are, however, the same *policy selection*. Region applicability, category
 applicability, precedence, and overrides all come from
-[tools/policy_rules.py](tools/policy_rules.py), which both tools read; the tools
+[policy/policy.py](policy/policy.py), which both tools read; the tools
 differ only in presentation — one describes, one decides. Two implementations of
 "which policy governs Australia" is two answers, and one of them is wrong.
 
@@ -134,7 +130,7 @@ Fixed precedence, resolved in Python before the tool runs:
 
 Session state is a fallback, never an override: a verified UK customer asking
 about Australian policy is asking about Australia. Names and codes are normalized
-from a table in `policy_rules` (`Australia`/`Australian`/`AU` → `AU`,
+from a table in `policy/policy.py` (`Australia`/`Australian`/`AU` → `AU`,
 `United Kingdom`/`UK`/`GB` → `GB`), so the country code is never something the
 model invents.
 
@@ -157,7 +153,7 @@ something apply.
 
 A `uuid4`, opaque, with no meaning of its own. What it permits — customer, order,
 item, and the policy that allowed it — is held server-side in
-[tools/eligibility_tokens.py](tools/eligibility_tokens.py). A token is issued only
+[agent/tools.py](agent/tools.py). A token is issued only
 on the eligible path, and `initiate_return` refuses any request that does not
 match the grant exactly. The model never generates or modifies one. No JWT: an
 unguessable key into a server-side record is the simpler equivalent.
@@ -180,12 +176,12 @@ state the model cannot write or forge; and every tool that reads customer data
 demands it and re-checks ownership itself. Swapping the mock for real
 authentication changes one function.
 
-See [tools/verify_identity.py](tools/verify_identity.py).
+See `verify_identity` in [agent/tools.py](agent/tools.py).
 
 ## Model routing
 
 Two models, chosen by a small function in
-[agent/routing.py](agent/routing.py) — no classifier, no routing agent. Asking
+[agent/agent.py](agent/agent.py) — no classifier, no routing agent. Asking
 an LLM which LLM to use costs a round trip to answer a question a boolean can
 answer, and makes the decision unreproducible.
 
@@ -224,12 +220,12 @@ so the intent is recorded on the session (`return_intent_expressed`) and cleared
 when the return context is.
 
 Neither model id appears in the code. `ANTHROPIC_MODEL_HAIKU` and
-`ANTHROPIC_MODEL_SONNET` are both required, and a test scans `agent/`, `tools/`,
-and `app.py` to keep it that way.
+`ANTHROPIC_MODEL_SONNET` are both required, and a test scans `agent/`, `policy/`,
+`app.py`, and `ui.py` to keep it that way.
 
 ## The agent loop
 
-One hand-written loop in [agent/orchestrator.py](agent/orchestrator.py):
+One hand-written loop in [agent/agent.py](agent/agent.py):
 
 1. Read the customer's message, and decide *first* whether it confirms a pending
    return.
@@ -266,7 +262,7 @@ two active orders the tools leave it nothing to guess with.
 Every tool call is recorded on the session as a `ToolTrace`: trace id, timestamp,
 session id, model and tier, tool name, sanitized arguments, status, latency, a
 one-line result summary, and any error. Every turn is recorded as a `ModelTurn`
-with the tier, the model id, and the routing reason. [ui/](ui/) renders them; the
+with the tier, the model id, and the routing reason. [ui.py](ui.py) renders them; the
 loop does not know a UI exists.
 
 Traces record **observable execution, not reasoning**. Nothing carries
@@ -300,7 +296,7 @@ that served the turn.
 
 Per turn, not one list at the bottom of the page: the point is to connect an
 action to the reply that produced it. Tools appear in execution order, and every
-latency shown is the one `invoke_timed` measured — nothing here is generated for
+latency shown is the one the loop measured around the call — nothing here is generated for
 the demo.
 
 The rule path is the graph traversal the decision came from: the item's category,
@@ -317,7 +313,7 @@ traces: an Anthropic outage, an unreachable policy graph, and a failed tool each
 reach the customer as one sentence, with the technical detail left in the trace.
 
 Model routing is visible but quiet — a small badge, never louder than the answer.
-The tier shown is whatever [agent/routing.py](agent/routing.py) decided; the UI
+The tier shown is whatever `select_model` in [agent/agent.py](agent/agent.py) decided; the UI
 displays the decision and does not influence it.
 
 Beside the chat, in the sidebar, a collapsed **Developer state** expander shows
@@ -326,9 +322,9 @@ item, return reason, eligibility, whether a token is held, whether a confirmatio
 is outstanding, confirmed, escalated. Separate from the trace, and collapsed,
 because it is a debugging view rather than part of the customer's experience.
 
-`ui/` holds no business logic. It calls no tool, evaluates no policy, chooses no
-model, and writes no trusted field; `agent/` and `tools/` do not import it.
-`ui.turns.capture_turn` slices the session's flat trace list into the turn that
+`ui.py` holds no business logic. It calls no tool, evaluates no policy, chooses no
+model, and writes no trusted field; `agent/` and `policy/` do not import it.
+`ui.capture_turn` slices the session's flat trace list into the turn that
 produced it, which is a presentation mapping rather than a change to the loop.
 
 ## Session state
@@ -350,9 +346,9 @@ confirmation. Switching order or item clears the token, so it can never be spent
 on a different item.
 
 Session state is not the safety boundary. `confirmed` is kept here for the
-conversation flow, but [initiate_return](tools/initiate_return.py) takes
-`eligibility_token` and `confirmed` as arguments and refuses on its own, so an
-orchestrator bug cannot produce a write the customer never agreed to.
+conversation flow, but `initiate_return` takes `eligibility_token` and
+`confirmed` as arguments and refuses on its own, so a bug in the loop cannot
+produce a write the customer never agreed to.
 
 ## Policy model
 
@@ -415,7 +411,7 @@ One session, five turns, no script:
 The wording is not load-bearing. "Can you check my delivery?", "I haven't
 received my book yet", "Can I send this back?", "Can I get a refund?", "Go
 ahead" all reach the same places — there is no phrase table anywhere, and
-[tests/test_hero_flow.py](tests/test_hero_flow.py) holds the alternatives to
+[tests/test_agent.py](tests/test_agent.py) holds the alternatives to
 keep it that way.
 
 Three things are worth watching in the traces as it runs:
@@ -423,7 +419,7 @@ Three things are worth watching in the traces as it runs:
 * **The agent does not guess.** Two live orders means `active_order_id` stays
   empty until Ada chooses one. Reading both out to build the question is
   browsing, not selecting — see `_browsing_orders` in
-  [agent/orchestrator.py](agent/orchestrator.py).
+  [agent/agent.py](agent/agent.py).
 * **Nothing is asked twice.** `verify_identity` runs once. Changing intent from
   status to return re-uses the verified customer, the region, and the chosen
   order, and a reason given at the eligibility step is still there at the write.
@@ -455,7 +451,7 @@ python scripts/reset_demo.py
 
 Restores `data/returns.json` from `data/seed/` and drops any eligibility tokens
 the process is holding. Idempotent. The **Reset demo** button in the Streamlit
-sidebar calls the same [agent/demo.py](agent/demo.py) function and additionally
+sidebar calls the same `agent.tools.reset_demo` function and additionally
 clears the conversation, the session state, and the traces — two copies of "put
 it back" is how a rehearsal and a live run end up starting from different
 places.
@@ -537,11 +533,11 @@ Two resets in the sidebar, and they are not the same thing. **Reset conversation
 forgets the conversation; the RMA it created is still a real record.
 **Reset demo** also restores `data/returns.json` from `data/seed/` and clears the
 eligibility tokens, which is what makes the [demo](#demo) rehearsable. It calls
-the same `agent.demo.reset_demo` as `python scripts/reset_demo.py`, rather than a
+the same `agent.tools.reset_demo` as `python scripts/reset_demo.py`, rather than a
 second copy of the logic.
 
 The tools still work without Anthropic: they are ordinary Python functions, and
-that is what the Phase 3 tests exercise.
+that is what [tests/test_tools.py](tests/test_tools.py) exercises.
 
 ### 5. Run the tests
 
@@ -551,22 +547,29 @@ pytest -m "not integration"   # unit tests only, no database needed
 pytest -m integration         # against the real seeded graph
 ```
 
+Five suites, split by behaviour rather than by module:
+
+| Suite | What it covers |
+| --- | --- |
+| [tests/test_agent.py](tests/test_agent.py) | Configuration, model routing, the tool loop, multi-turn state, tracing, and the hero journey end to end |
+| [tests/test_tools.py](tests/test_tools.py) | The six callable tools, identity and order lookup, the write, and the integrity of the mock data |
+| [tests/test_policy.py](tests/test_policy.py) | Regional applicability, AU consistency, precedence, ebooks, promotions, the Neo4j requirement, and the graph seed |
+| [tests/test_guardrails.py](tests/test_guardrails.py) | Ownership, eligibility tokens, confirmation, idempotency, escalation, and the outside-the-window ending |
+| [tests/test_ui.py](tests/test_ui.py) | Formatting, trace sanitization, trace-to-turn association, reset, and `app.py` itself |
+
 The agent tests stub Anthropic as well as Neo4j: `FakeAnthropic` in
 [tests/conftest.py](tests/conftest.py) replays a scripted sequence of responses,
 so the tool loop, the routing, the confirmation gate, and the tracing are all
 exercised with no network, no API key, and no model non-determinism. What is
-under test is the orchestrator's behaviour given a model's output — not the
+under test is the agent's behaviour given a model's output — not the
 model.
 
-The UI is tested too, at the level worth testing. The display helpers in
-[ui/format.py](ui/format.py) and the trace-to-turn mapping in
-[ui/turns.py](ui/turns.py) are pure functions, so
-[tests/test_ui_presentation.py](tests/test_ui_presentation.py) checks them
-directly. [tests/test_ui_app.py](tests/test_ui_app.py) drives `app.py` itself
-through Streamlit's own `AppTest` — in process, no browser, no server — typing the
-hero flow into the chat box and asserting on what appears under each reply, on
-both reset buttons, and on the absence of an email address or a token in the
-trace. No browser automation.
+The UI is tested too, at the level worth testing. The display helpers and the
+trace-to-turn mapping in [ui.py](ui.py) are pure functions, so they are checked
+directly; the same suite then drives `app.py` itself through Streamlit's own
+`AppTest` — in process, no browser, no server — typing the hero flow into the chat
+box and asserting on what appears under each reply, on both reset buttons, and on
+the absence of an email address or a token in the trace. No browser automation.
 
 Unit tests stub the policy graph from `neo4j/policy_graph.json` — the same seed
 that was ingested — so they run offline. The integration group takes no stub and

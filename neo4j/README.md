@@ -160,13 +160,18 @@ lists no `exceptions`, so a faulty ebook is an escalation rather than a return.
 - [seed.cypher](seed.cypher) — the same model by hand, for reading; `ingest.py`
   is what you should actually run
 
-## Not implemented yet
+## How the app reads this
 
-The eligibility queries and the agent's use of the graph. `search_policy` and
-`check_return_eligibility` are stubs; when they land they will query Neo4j
-through [agent/graph.py](../agent/graph.py), which raises
-`PolicyGraphUnavailableError` rather than degrading. Example read queries are
-commented at the end of [seed.cypher](seed.cypher).
+[policy/graph.py](../policy/graph.py) opens the driver and runs the one policy
+query; [policy/policy.py](../policy/policy.py) turns the result into candidates,
+applies the region and promotion conditions, ranks what is left by precedence,
+and builds the rule path. Both `search_policy` and `check_return_eligibility` go
+through it, which is what keeps an informational answer and a decision from
+disagreeing. If the graph is unreachable, `PolicyGraphUnavailableError` is raised
+rather than degrading. Example read queries are commented at the end of
+[seed.cypher](seed.cypher).
 
-The test suite needs no database — it exercises fixture validation and
-configuration errors only. Anything that answers a policy question does.
+The unit tests need no database — they stub the graph from
+[policy_graph.json](policy_graph.json), the same seed ingestion reads.
+`pytest -m integration` re-checks the same decisions against the live database,
+which is what keeps the stub honest.

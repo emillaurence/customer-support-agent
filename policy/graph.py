@@ -1,8 +1,8 @@
 """The Neo4j connection every policy decision goes through.
 
-Neo4j is a **required** dependency. Return policy, eligibility rules, policy
-overrides, regional overrides, and the explainable rule path are all resolved by
-Cypher against the graph. There is no JSON policy engine to fall back to: if the
+Neo4j is a **required** dependency: return policy, regional overrides,
+precedence, and the explainable rule path are all resolved by Cypher against the
+graph. There is deliberately no JSON policy engine to fall back to — if the
 database is unconfigured or unreachable, `get_driver` raises and the tool fails
 loudly rather than answering a customer from a stale fixture.
 
@@ -21,26 +21,37 @@ from neo4j import Driver, GraphDatabase
 REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD")
 
 _driver: Driver | None = None
+"""The one driver for the process.
+
+A Neo4j `Driver` owns a connection pool and is designed to be built once and
+shared; every query borrows a short-lived session from it. Opening a driver per
+call would pay TCP, TLS, and Bolt handshakes on every policy lookup — the
+dominant cost of an otherwise millisecond query.
+"""
+
+POOL_SIZE = 20
+"""Connections kept in the pool. Comfortably above the concurrency of one
+Streamlit process, so a policy read never waits for a free connection."""
+
+ACQUISITION_TIMEOUT_SECONDS = 5.0
+"""How long a query waits for a connection before giving up. Bounded, so a wedged
+database surfaces as an outage the customer is told about rather than a hang."""
+
+TRANSACTION_RETRY_SECONDS = 5.0
+"""The driver's own retry budget for transient cluster errors. Bounded for the
+same reason, and left to the driver rather than reimplemented here."""
 
 
 class PolicyGraphUnavailableError(RuntimeError):
-    """Neo4j is not configured or not reachable.
-
-    Raised instead of degrading to JSON or returning a mocked policy result.
-    Callers should let it surface: a support agent that cannot read the policy
-    graph must say so, not guess.
-    """
+    """Raised instead of degrading to JSON or a mocked result: a support agent
+    that cannot read the policy graph must say so, not guess."""
 
 
 def get_driver() -> Driver:
     """Return the shared driver, opening and verifying it on first use.
 
-    Returns:
-        A driver whose connectivity has been confirmed.
-
-    Raises:
-        PolicyGraphUnavailableError: If any of NEO4J_URI, NEO4J_USERNAME, or
-            NEO4J_PASSWORD is unset, or the server does not answer.
+    Idempotent: after the first call this is a module-attribute read, so the
+    per-query cost is borrowing a pooled connection and nothing else.
     """
     global _driver
     if _driver is not None:
@@ -57,7 +68,11 @@ def get_driver() -> Driver:
         )
 
     driver = GraphDatabase.driver(
-        config["NEO4J_URI"], auth=(config["NEO4J_USERNAME"], config["NEO4J_PASSWORD"])
+        config["NEO4J_URI"],
+        auth=(config["NEO4J_USERNAME"], config["NEO4J_PASSWORD"]),
+        max_connection_pool_size=POOL_SIZE,
+        connection_acquisition_timeout=ACQUISITION_TIMEOUT_SECONDS,
+        max_transaction_retry_time=TRANSACTION_RETRY_SECONDS,
     )
     try:
         driver.verify_connectivity()
@@ -73,19 +88,15 @@ def get_driver() -> Driver:
 
 
 def close_driver() -> None:
-    """Close the shared driver, if one was opened. Safe to call twice."""
+    """Close the shared driver and drop it, so the next call opens a fresh one.
+
+    For process shutdown and for tests. Idempotent.
+    """
     global _driver
     if _driver is not None:
         _driver.close()
         _driver = None
 
-
-# --- Policy retrieval ---------------------------------------------------
-#
-# One Cypher query, used by both policy tools. `search_policy` presents the
-# result to a customer as information; `check_return_eligibility` filters it by
-# applicability and decides. Sharing the read keeps the two from drifting into
-# two different ideas of what the graph says, without either owning the other.
 
 CATEGORY_POLICIES = """
 MATCH (category:Category {name: $product_type})-[:GOVERNED_BY]->(policy:Policy)
@@ -103,16 +114,13 @@ def fetch_policies_for_category(product_type: str) -> list[dict[str, Any]]:
     """Read every policy governing one product category, with its edges.
 
     The edges come back alongside the properties because they are what makes a
-    policy conditional. `granted_to_regions` non-empty means the policy is only
-    reachable for customers in those regions; `outranks` is what the policy
-    displaces, and is what an explanation is built from.
+    policy conditional: `granted_to_regions` non-empty means it is only reachable
+    for customers in those regions, and `outranks` is what it displaces. One row
+    per policy, highest precedence first; empty for an unknown category.
 
-    Args:
-        product_type: A `:Category` name — 'PhysicalBook' or 'EBook'.
-
-    Returns:
-        One row per policy, highest precedence first. Empty if the category has
-        no policies, or does not exist.
+    Runs through `execute_query`, which borrows a session from the shared
+    driver's pool and returns it — the connection outlives the call, the session
+    does not.
 
     Raises:
         PolicyGraphUnavailableError: If Neo4j is unconfigured or unreachable.
@@ -125,10 +133,5 @@ def fetch_policies_for_category(product_type: str) -> list[dict[str, Any]]:
 
 
 def _to_python(value: Any) -> Any:
-    """Flatten a Neo4j temporal value to something Pydantic can parse.
-
-    The seed stores dates as ISO strings, so this is usually a no-op — but a
-    property written as a Cypher `date()` would come back as a `neo4j.time.Date`,
-    and `Policy` expects a `date`.
-    """
+    """Flatten a Neo4j temporal value so Pydantic can parse it as a `date`."""
     return value.to_native() if hasattr(value, "to_native") else value

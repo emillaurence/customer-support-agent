@@ -1,58 +1,15 @@
-"""Bookly support agent: orchestrator, model routing, prompt, session state,
-tracing, domain models, and the required Neo4j connection behind every policy
-decision.
+"""The Bookly support agent.
 
-`BooklyAgent` is imported lazily, and has to be. The dependency runs in both
-directions: the tools read policy from `agent.graph`, and the orchestrator
-dispatches to the tools. Importing the orchestrator here eagerly would mean
-`import tools` initialises this package, which imports the orchestrator, which
-imports `tools` — while `tools` is still half-built.
+Three modules, and they are the whole thing:
 
-PEP 562 breaks it. `from agent import BooklyAgent` still works and still
-type-checks; the orchestrator module is simply not touched until something asks
-for it, by which point `tools` has finished importing.
+* `agent.agent` — how the agent works: configuration, the system prompt, model
+  routing, the confirmation gate, and the Anthropic tool loop.
+* `agent.tools` — what it can do: the six model-callable tools, their schemas,
+  the dispatch that injects trusted arguments, and the trusted-state updates.
+* `agent.state` — what it remembers: the domain records, the execution traces,
+  and `SessionState`.
+
+Deliberately empty of imports. Dependencies run one way — `policy` ← `state` ←
+`tools` ← `agent` — and a re-export here would make importing any one module
+initialise all of them, reintroducing the cycle this layout removed.
 """
-
-from typing import TYPE_CHECKING
-
-from agent.config import AnthropicConfig, AnthropicConfigError, load_anthropic_config
-from agent.graph import (
-    PolicyGraphUnavailableError,
-    close_driver,
-    fetch_policies_for_category,
-    get_driver,
-)
-from agent.routing import ModelDecision, ModelTier, select_model
-from agent.state import SessionState
-from agent.tracing import ModelTurn, ToolStatus, ToolTrace
-
-if TYPE_CHECKING:  # pragma: no cover - for type checkers only, never at runtime
-    from agent.orchestrator import BooklyAgent
-
-
-def __getattr__(name: str):
-    """Resolve `BooklyAgent` on first use, after `tools` has finished importing."""
-    if name == "BooklyAgent":
-        from agent.orchestrator import BooklyAgent
-
-        return BooklyAgent
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = [
-    "AnthropicConfig",
-    "AnthropicConfigError",
-    "BooklyAgent",
-    "ModelDecision",
-    "ModelTier",
-    "ModelTurn",
-    "PolicyGraphUnavailableError",
-    "SessionState",
-    "ToolStatus",
-    "ToolTrace",
-    "close_driver",
-    "fetch_policies_for_category",
-    "get_driver",
-    "load_anthropic_config",
-    "select_model",
-]
