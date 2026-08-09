@@ -22,7 +22,15 @@ from pathlib import Path
 
 import pytest
 
-from agent.state import Customer, Item, Order, OrderStatus, ReturnRecord, SessionState
+from agent.state import (
+    Customer,
+    Item,
+    Order,
+    OrderStatus,
+    ReturnRecord,
+    SessionState,
+    ToolStatus,
+)
 from agent.tools import (
     TOOL_SCHEMAS,
     _load_returns,
@@ -582,6 +590,98 @@ def test_compaction_does_not_disturb_trusted_state(verified, seeded_graph, now: 
     assert state.eligibility_token
     assert state.pending_return is not None
     assert state.eligibility is not None and state.eligibility.rule_path
+
+
+def test_comparing_two_items_in_one_turn_keeps_the_first_grant(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """Checking a second item does not spend a token already granted for the first.
+
+    Reproduces a real session: a customer's order carries a physical book (in
+    the AU extended window) and an ebook (never returnable). Both get checked in
+    the same turn — "can I return either of these?" — and the ebook coming back
+    ineligible must not clear the pending return the paperback's check already
+    created. `adopt_active_item=False` is what one model turn checking several
+    items looks like; the loop computes it from the batch of tool calls.
+    """
+    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+    order_id, physical_item, ebook_item = "ORD-1003", "ITEM-102", "ITEM-201"
+
+    eligible = invoke_tool(
+        "check_return_eligibility", {"order_id": order_id, "item_id": physical_item}, bruce, now=now
+    )
+    apply_tool_result(
+        "check_return_eligibility",
+        {"order_id": order_id, "item_id": physical_item},
+        eligible,
+        bruce,
+        adopt_active_item=False,
+    )
+    assert bruce.pending_return is not None
+    token_after_first_check = bruce.eligibility_token
+    assert token_after_first_check
+
+    ineligible = invoke_tool(
+        "check_return_eligibility", {"order_id": order_id, "item_id": ebook_item}, bruce, now=now
+    )
+    apply_tool_result(
+        "check_return_eligibility",
+        {"order_id": order_id, "item_id": ebook_item},
+        ineligible,
+        bruce,
+        adopt_active_item=False,
+    )
+
+    # The ebook's own refusal is not lost...
+    assert ineligible.payload.eligible is False
+    # ...but the paperback's grant, from earlier in the same turn, survives.
+    assert bruce.pending_return is not None
+    assert bruce.pending_return.item_id == physical_item
+    assert bruce.eligibility_token == token_after_first_check
+
+    # And the surviving token actually spends: this is the return that was
+    # wrongly blocked in the session that surfaced the bug.
+    bruce.confirmed = True
+    opened = invoke_tool(
+        "initiate_return", {"order_id": order_id, "item_id": physical_item}, bruce, now=now
+    )
+    assert opened.status is ToolStatus.OK
+    assert opened.payload.created is True
+
+
+def test_checking_a_different_item_on_its_own_turn_still_clears_the_old_one(
+    verified, seeded_graph, now: datetime
+) -> None:
+    """The clearing this guards against is still real: a genuine switch — one
+    item checked, then later a different one, each its own turn — drops the
+    first item's token exactly as before. Only *comparing* items in one turn is
+    protected."""
+    bruce = SessionState(verified_customer_id="CUST-002", customer_region="AU")
+    order_id, physical_item, ebook_item = "ORD-1003", "ITEM-102", "ITEM-201"
+
+    eligible = invoke_tool(
+        "check_return_eligibility", {"order_id": order_id, "item_id": physical_item}, bruce, now=now
+    )
+    apply_tool_result(
+        "check_return_eligibility",
+        {"order_id": order_id, "item_id": physical_item},
+        eligible,
+        bruce,
+    )
+    assert bruce.pending_return is not None
+
+    ineligible = invoke_tool(
+        "check_return_eligibility", {"order_id": order_id, "item_id": ebook_item}, bruce, now=now
+    )
+    apply_tool_result(
+        "check_return_eligibility",
+        {"order_id": order_id, "item_id": ebook_item},
+        ineligible,
+        bruce,
+    )
+
+    assert bruce.pending_return is None
+    assert bruce.eligibility_token is None
 
 
 # --- The mock data ------------------------------------------------------

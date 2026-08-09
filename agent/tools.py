@@ -1231,6 +1231,7 @@ def apply_tool_result(
     state: SessionState,
     *,
     adopt_active_order: bool = True,
+    adopt_active_item: bool = True,
 ) -> None:
     """Update session state from a tool result — and only from a tool result.
 
@@ -1244,6 +1245,11 @@ def apply_tool_result(
         adopt_active_order: Whether a successful `lookup_order` may make its order
             the one under discussion. False when the same turn read several orders
             — that is the agent browsing to build a question, not selecting.
+        adopt_active_item: Whether a successful `check_return_eligibility` may
+            replace the item under discussion. False when the same turn checks
+            several items — that is the agent comparing them, not the customer
+            abandoning whichever was already found eligible, so an existing
+            pending return and its token are left alone rather than cleared.
     """
     if outcome.status is not ToolStatus.OK or outcome.payload is None:
         return
@@ -1271,19 +1277,31 @@ def apply_tool_result(
     elif name == "check_return_eligibility":
         order_id = outcome.args_used["order_id"]
         item_id = outcome.args_used["item_id"]
+        state.eligibility = payload
+        if args.get("reason"):
+            state.return_reason = args["reason"]
+
+        switching_item = (
+            state.active_item_id not in (None, item_id) or state.active_order_id != order_id
+        )
+
+        if switching_item and not adopt_active_item and state.pending_return is not None:
+            # The same turn is checking a second item while one is already
+            # pending — the agent comparing candidates, not the customer walking
+            # away from the first. Leave the existing pending return and its
+            # token exactly as they were; this call gets no say over them.
+            return
 
         # A new item means the old attempt is over. Clearing first drops the
-        # previous token, decision, and any confirmation, so nothing from the last
-        # item can be spent on this one.
-        if state.active_item_id not in (None, item_id) or state.active_order_id != order_id:
+        # previous token, decision, and any confirmation, so nothing from the
+        # last item can be spent on this one.
+        if switching_item:
             state.clear_return_context()
+            state.eligibility = payload  # clear_return_context just wiped this
 
         state.active_order_id = order_id
         state.active_item_id = item_id
-        state.eligibility = payload
         state.eligibility_token = payload.eligibility_token
-        if args.get("reason"):
-            state.return_reason = args["reason"]
 
         if payload.eligible and payload.eligibility_token:
             # There is now something a "yes" could authorise. It does not count

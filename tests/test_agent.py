@@ -1380,12 +1380,13 @@ def test_a_uniquely_named_book_goes_straight_to_eligibility(make_agent, seeded_g
     The title matches one item on one of Bruce's orders, so the listing has
     already produced everything the check needs. No "shall I check that one?",
     because he said which one; and no second `lookup_order` for the detail,
-    because nothing downstream asked for a date.
+    because nothing downstream asked for a date. And no scripted response for
+    the listing itself — once identity is verified mid-return-workflow, the
+    loop calls it deterministically rather than waiting for Claude to ask.
     """
     agent, _ = make_agent(
         text("Happy to look. What's the email on your Bookly account?"),
         tool_call("verify_identity", {"email": BRUCE_EMAIL}),
-        tool_call("lookup_order", {}, block_id="toolu_list"),
         tool_call(
             "check_return_eligibility",
             {"order_id": EBOOK_ORDER, "item_id": EBOOK_ITEM},
@@ -1413,11 +1414,12 @@ def test_an_ambiguous_request_is_asked_about_before_anything_is_decided(
     """"One of my books" matches several, so the listing settles nothing.
 
     The agent asks, and no eligibility check runs on a guess — `active_order_id`
-    is still None, which is what leaves it with nothing to guess *with*.
+    is still None, which is what leaves it with nothing to guess *with*. The
+    listing itself is not scripted here either: it runs deterministically the
+    moment identity verifies mid-return-workflow, before Claude is asked again.
     """
     agent, _ = make_agent(
         tool_call("verify_identity", {"email": BRUCE_EMAIL}),
-        tool_call("lookup_order", {}, block_id="toolu_list"),
         text("You've got a few. Which one would you like to return?"),
     )
     state = SessionState()
@@ -1429,6 +1431,45 @@ def test_an_ambiguous_request_is_asked_about_before_anything_is_decided(
     assert "which one" in reply.lower()
     assert state.active_order_id is None
     assert state.active_item_id is None
+
+
+def test_verifying_identity_mid_return_loads_orders_without_asking_claude(
+    make_agent, seeded_graph
+) -> None:
+    """The deterministic gate: verified, mid-return-workflow, nothing loaded yet
+    — `lookup_order` runs the moment identity succeeds, without Claude asking
+    for it. Only two round trips are scripted here — one that verifies, one that
+    reads the listing back — because a third, spent on Claude requesting the
+    listing itself, never has to happen.
+    """
+    agent, client = make_agent(
+        tool_call("verify_identity", {"email": BRUCE_EMAIL}),
+        text("You've got a few orders — which one did you want to return?"),
+    )
+    state = SessionState()
+
+    agent.respond(state, f"I want to return a book, it's {BRUCE_EMAIL}")
+
+    assert tool_names(state) == ["verify_identity", "lookup_order"]
+    assert state.active_order_ids  # the listing actually populated this
+    assert len(client.calls) == 2  # verify, then the reply — no separate ask for the listing
+
+
+def test_verifying_identity_outside_a_return_does_not_auto_load_orders(
+    make_agent, seeded_graph
+) -> None:
+    """Outside a return workflow, `lookup_order` stays Claude's call.
+
+    Nothing here asked about a return, so `return_workflow_active` is False and
+    the deterministic gate does not fire — the same identity check that is
+    auto-followed by a listing in the test above runs alone here.
+    """
+    agent, _ = make_agent(tool_call("verify_identity", {"email": HERO_EMAIL}), text("Found you."))
+    state = SessionState()
+
+    agent.respond(state, HERO_EMAIL)
+
+    assert tool_names(state) == ["verify_identity"]
 
 
 def test_the_listing_alone_cannot_reach_another_customers_order(make_agent) -> None:

@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+import types
+import uuid
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -640,10 +642,42 @@ class BooklyAgent:
             # user message — what the Messages API expects, and splitting them
             # teaches the model not to ask for more than one at a time.
             adopt_active_order = not _browsing_orders(tool_uses)
+            adopt_active_item = not _comparing_items(tool_uses)
             results = []
             for block in tool_uses:
                 turn.tool_calls += 1
-                results.append(self._run_one_tool(state, decision, model_id, block, adopt_active_order))
+                results.append(
+                    self._run_one_tool(
+                        state, decision, model_id, block, adopt_active_order, adopt_active_item
+                    )
+                )
+
+            # Identity just verified, a return workflow already open, and no
+            # order on record yet: `lookup_order` is not a choice Claude has to
+            # make, it is the deterministic next step — so Python takes it
+            # rather than spending a round trip asking Claude to ask for it.
+            # Appended as if Claude had requested it, into the same assistant
+            # turn, so the result reaches Claude on the very next call.
+            if (
+                any(getattr(b, "name", "") == "verify_identity" for b in tool_uses)
+                and state.is_verified
+                and state.return_workflow_active
+                and not state.active_order_ids
+                and not any(getattr(b, "name", "") == "lookup_order" for b in tool_uses)
+            ):
+                turn.tool_calls += 1
+                block = types.SimpleNamespace(
+                    id=f"toolu_auto_{uuid.uuid4().hex[:16]}", name="lookup_order", input={}
+                )
+                state.transcript[-1]["content"].append(
+                    {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+                )
+                results.append(
+                    self._run_one_tool(
+                        state, decision, model_id, block, adopt_active_order, adopt_active_item
+                    )
+                )
+
             state.transcript.append({"role": "user", "content": results})
 
         # Out of iterations. Something is looping; say so rather than trying
@@ -658,6 +692,7 @@ class BooklyAgent:
         model_id: str,
         block: Any,
         adopt_active_order: bool,
+        adopt_active_item: bool = True,
     ) -> dict[str, Any]:
         """Run one requested tool, trace it, and update state from what it returned."""
         name = getattr(block, "name", "")
@@ -670,7 +705,14 @@ class BooklyAgent:
         # State is updated only from a tool that actually succeeded. A blocked
         # guard or a failed call leaves the session exactly as it was.
         if outcome.status is ToolStatus.OK:
-            apply_tool_result(name, args, outcome, state, adopt_active_order=adopt_active_order)
+            apply_tool_result(
+                name,
+                args,
+                outcome,
+                state,
+                adopt_active_order=adopt_active_order,
+                adopt_active_item=adopt_active_item,
+            )
 
         # The arguments as they were actually used — trusted values included, so
         # the trace shows the real call — with anything sensitive masked. The log
@@ -837,6 +879,23 @@ def _browsing_orders(tool_uses: list[Any]) -> bool:
         if getattr(block, "name", "") == "lookup_order"
     }
     return len(order_ids - {None}) > 1
+
+
+def _comparing_items(tool_uses: list[Any]) -> bool:
+    """Whether this response is checking several items against each other rather
+    than settling on one.
+
+    Mirrors `_browsing_orders`: to weigh two items — "is the paperback eligible,
+    or only the ebook?" — the agent checks both in the same turn. Treating the
+    second check as the customer abandoning the first would drop a pending
+    return, and its token, that nothing has actually reopened.
+    """
+    item_ids = {
+        (getattr(block, "input", None) or {}).get("item_id")
+        for block in tool_uses
+        if getattr(block, "name", "") == "check_return_eligibility"
+    }
+    return len(item_ids - {None}) > 1
 
 
 def _assistant_text(text: str) -> dict[str, Any]:
