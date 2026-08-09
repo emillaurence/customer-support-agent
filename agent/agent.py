@@ -726,8 +726,10 @@ class BooklyAgent:
             if eligibility_batch:
                 # Every check this turn has run; decide once, from all of them
                 # together, what — if anything — is left pending. See
-                # reconcile_eligibility_batch: a lone eligible candidate becomes
-                # the pending return, and zero or several leave nothing pending.
+                # reconcile_eligibility_batch: zero eligible leaves nothing
+                # pending, one eligible leaves one pending candidate, and
+                # several eligible candidates are all kept pending, unconfirmed,
+                # until the customer's selection is resolved.
                 reconcile_eligibility_batch(state, eligibility_batch)
 
             state.transcript.append({"role": "user", "content": results})

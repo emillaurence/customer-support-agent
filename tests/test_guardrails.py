@@ -600,6 +600,44 @@ def test_a_new_conversation_starts_unescalated() -> None:
     assert SessionState().escalated is False
 
 
+def test_initiate_return_is_blocked_deterministically_once_escalated(
+    token: str, data_dir: Path
+) -> None:
+    """Once handed to a human, no return may open — even a fully confirmed,
+    eligible one already sitting on the session. The model is told not to keep
+    acting after an escalation, but this holds regardless of what it does: the
+    guard runs before dispatch, so the mutation implementation is never called."""
+    order_id, item_id, customer_id = ELIGIBLE
+    state = SessionState(
+        verified_customer_id=customer_id,
+        escalated=True,
+        pending_returns=[
+            PendingReturn(
+                customer_id=customer_id,
+                order_id=order_id,
+                item_id=item_id,
+                eligibility_token=token,
+                asked=True,
+                confirmed=True,
+            )
+        ],
+    )
+    before = returns_on_disk(data_dir)
+
+    outcome = invoke_tool("initiate_return", {"order_id": order_id, "item_id": item_id}, state)
+
+    assert outcome.status is ToolStatus.BLOCKED
+    assert "escalated" in (outcome.error or "")
+    assert returns_on_disk(data_dir) == before, "a blocked return must not write"
+    assert token not in outcome.content, "the token must never leak into a tool result"
+    # The pending return itself is untouched — still confirmed, still spendable
+    # if escalation were ever lifted, and not silently converted into an RMA.
+    assert state.pending_returns[0].confirmed is True
+    assert not any(
+        r.order_id == order_id and r.item_id == item_id for r in _load_returns()
+    ), "no RMA was created for the blocked return"
+
+
 # =========================================================================
 # The outside-the-window ending
 #

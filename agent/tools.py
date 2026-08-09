@@ -942,6 +942,19 @@ def invoke_tool(
             args_used=dict(args),
         )
 
+    if name == "initiate_return" and state.escalated:
+        # Once a conversation has been handed to a human, no return may open
+        # after it — the model is told to stop acting, but this makes it true
+        # regardless of what it does. Checked before dispatch, so the mutation
+        # implementation never runs.
+        return ToolOutcome(
+            status=ToolStatus.BLOCKED,
+            content="The return was not opened: return blocked: workflow has already been escalated.",
+            summary="return blocked: escalated",
+            error="return blocked: workflow has already been escalated",
+            args_used=dict(args),
+        )
+
     if name in NEEDS_VERIFICATION and not state.is_verified:
         # The tools enforce this themselves too. Refusing here keeps an
         # unverifiable call from being made at all, and gives the model a reason
