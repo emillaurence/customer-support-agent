@@ -901,6 +901,10 @@ def _policy_decision(payload: Any) -> dict[str, Any] | None:
         "eligible": payload.eligible,
         "policy_id": payload.policy_id,
         "rule_path": payload.rule_path,
+        "product_type": payload.product_type,
+        "region": payload.region,
+        "return_window_days": payload.return_window_days,
+        "existing_return_id": payload.existing_return_id,
         "days_remaining": payload.days_remaining,
     }
 

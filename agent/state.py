@@ -111,7 +111,26 @@ class EligibilityDecision(BaseModel):
     eligible: bool
     policy_id: str | None = None
     explanation: str = Field(default="", description="Customer-facing. Safe to read aloud.")
-    rule_path: list[str] = Field(default_factory=list)
+    rule_path: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Raw graph hops behind the match. Kept for debugging and backward "
+            "compatibility; the trace displays the friendlier `policy_path` "
+            "derived from the fields below instead of this traversal."
+        ),
+    )
+    product_type: str | None = Field(
+        default=None, description="The item's category, for the displayed policy path."
+    )
+    region: str | None = Field(
+        default=None, description="Set only when the winning policy is region-specific."
+    )
+    return_window_days: int | None = Field(
+        default=None, description="The winning policy's window, if it offers one."
+    )
+    existing_return_id: str | None = Field(
+        default=None, description="The open return that blocked this check, if any."
+    )
     eligibility_token: str | None = Field(
         default=None, description="Issued only when eligible. Required by initiate_return."
     )

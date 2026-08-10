@@ -496,6 +496,15 @@ def check_return_eligibility(
         item.product_type.value, policy.policy_id, winner.granted_by_region, winner.outranks
     )
 
+    # Structured facts behind this call's policy path, shared by every branch
+    # below — the trace renders these rather than re-deriving them from `rule_path`.
+    path_fields = {
+        "rule_path": rule_path,
+        "product_type": item.product_type.value,
+        "region": winner.granted_by_region,
+        "return_window_days": policy.window_days,
+    }
+
     existing = _open_return(order_id, item_id)
     if existing is not None:
         return EligibilityDecision(
@@ -505,7 +514,8 @@ def check_return_eligibility(
                 f"There's already a return open for {item.title} on order {order_id} "
                 f"({existing.return_id}), so I can't start a second one."
             ),
-            rule_path=rule_path,
+            existing_return_id=existing.return_id,
+            **path_fields,
         )
 
     # No window is not a window of zero days: it means returns are not offered,
@@ -518,7 +528,7 @@ def check_return_eligibility(
                 f"{item.title} is a digital item, and "
                 f"{policy.summary[0].lower()}{policy.summary[1:]}"
             ),
-            rule_path=rule_path,
+            **path_fields,
         )
 
     if details.order.delivered_at is None:
@@ -529,7 +539,7 @@ def check_return_eligibility(
                 f"Order {order_id} hasn't arrived yet, so the {policy.window_days}-day "
                 f"return window hasn't started. You can return it once it's delivered."
             ),
-            rule_path=rule_path,
+            **path_fields,
         )
 
     days_since_delivery = (today - details.order.delivered_at).days
@@ -542,8 +552,8 @@ def check_return_eligibility(
                 f"window for it is {policy.window_days} days, so it's outside the window by "
                 f"{days_since_delivery - policy.window_days} days."
             ),
-            rule_path=rule_path,
             days_remaining=0,
+            **path_fields,
         )
 
     days_remaining = policy.window_days - days_since_delivery
@@ -555,11 +565,11 @@ def check_return_eligibility(
             f"is {policy.window_days} days, so it can be returned — you have {days_remaining} "
             f"day{'s' if days_remaining != 1 else ''} left."
         ),
-        rule_path=rule_path,
         eligibility_token=_create_eligibility_token(
             customer_id, order_id, item_id, policy.policy_id
         ),
         days_remaining=days_remaining,
+        **path_fields,
     )
 
 

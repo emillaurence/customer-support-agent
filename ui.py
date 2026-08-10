@@ -370,8 +370,46 @@ def format_rule_path(rule_path: list[str]) -> str:
 
     Empty when there is no path: a refusal that never reached a policy has none,
     and inventing one would suggest a traversal that never happened.
+
+    Kept for the raw graph traversal (debugging, tests); the trace itself shows
+    `format_policy_path` instead, which does not flatten override/region edges
+    into a fake linear chain.
     """
     return " → ".join(rule_path_nodes(rule_path))
+
+
+def policy_path_steps(decision: dict[str, Any]) -> list[str]:
+    """The business-friendly decision path for one eligibility check: input
+    context, the policy that applies, what blocked it (if anything), and the
+    outcome — never the raw graph traversal behind the match.
+
+    Built only from this call's own structured fields (`product_type`,
+    `region`, `policy_id`, `return_window_days`, `existing_return_id`), so it
+    cannot drift into implying the policy itself caused a rejection that was
+    really an existing return, or borrow a sibling item's decision.
+    """
+    steps: list[str] = []
+
+    product_type = decision.get("product_type")
+    region = decision.get("region")
+    if product_type:
+        steps.append(f"{product_type} + {region}" if region else product_type)
+
+    if policy_id := decision.get("policy_id"):
+        window_days = decision.get("return_window_days")
+        steps.append(f"{policy_id} ({window_days} days)" if window_days else policy_id)
+
+    if existing_return_id := decision.get("existing_return_id"):
+        steps.append(f"Existing return: {existing_return_id}")
+
+    if steps:
+        steps.append(decision_label(bool(decision.get("eligible"))))
+    return steps
+
+
+def format_policy_path(decision: dict[str, Any]) -> str:
+    """`policy_path_steps` joined for display, or empty when nothing applied."""
+    return " → ".join(policy_path_steps(decision))
 
 
 # --- Rendering -----------------------------------------------------------
@@ -474,14 +512,18 @@ def render_policy_decision(decision: dict[str, Any]) -> None:
 
     Showing the path is what distinguishes an *evaluated* answer from a guessed
     one. The Cypher is not shown: the traversal is the explanation, the query is
-    an implementation detail.
+    an implementation detail. The path itself is the business-friendly decision
+    path (input context → applicable policy → blocker → outcome), not the raw
+    Neo4j hops — an applicable policy and the reason it was blocked are kept
+    distinct, so `AU_BOOKLY_EXTENDED_RETURN` never reads as having caused a
+    rejection that was really an existing return.
     """
     st.markdown(
         f"**Policy** · {decision.get('policy_id') or '—'} "
         f"· **Decision** · {decision_label(bool(decision.get('eligible')))}"
     )
-    if path := format_rule_path(decision.get("rule_path") or []):
-        st.caption("Rule path")
+    if path := format_policy_path(decision):
+        st.caption("Policy path")
         st.markdown(f'<div class="bookly-path">{path}</div>', unsafe_allow_html=True)
 
 

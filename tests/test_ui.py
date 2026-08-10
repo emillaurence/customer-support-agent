@@ -328,6 +328,75 @@ def test_the_path_comes_off_a_real_decision(seeded_graph, now) -> None:
 
 
 # =========================================================================
+# The business-friendly policy path — what the trace actually shows
+# =========================================================================
+#
+# `rule_path` above is the raw graph traversal, kept for debugging. The trace
+# renders `policy_path_steps`/`format_policy_path` instead: input context,
+# applicable policy, blocker, decision — never a flattened override/region
+# chain that reads as one continuous walk.
+
+
+def test_au_physical_eligible_shows_context_policy_and_decision() -> None:
+    decision = {
+        "eligible": True,
+        "policy_id": "AU_BOOKLY_EXTENDED_RETURN",
+        "product_type": "PhysicalBook",
+        "region": "AU",
+        "return_window_days": 45,
+    }
+
+    assert ui.policy_path_steps(decision) == [
+        "PhysicalBook + AU",
+        "AU_BOOKLY_EXTENDED_RETURN (45 days)",
+        "Eligible",
+    ]
+    path = ui.format_policy_path(decision)
+    assert path == "PhysicalBook + AU → AU_BOOKLY_EXTENDED_RETURN (45 days) → Eligible"
+    # The misleading flattened traversal never appears: no region override node
+    # sits between the policy and a displaced policy in the displayed path.
+    assert "HOLIDAY_EXTENDED_RETURN" not in path
+    assert "AU_BOOKLY_EXTENDED_RETURN → AU" not in path
+
+
+def test_ebook_ineligible_omits_a_region_that_does_not_apply() -> None:
+    decision = {
+        "eligible": False,
+        "policy_id": "DIGITAL_NO_RETURN",
+        "product_type": "EBook",
+        "region": None,
+        "return_window_days": None,
+    }
+
+    assert ui.format_policy_path(decision) == "EBook → DIGITAL_NO_RETURN → Not eligible"
+
+
+def test_existing_return_names_the_blocker_without_blaming_the_policy() -> None:
+    """An applicable policy and the reason the return was refused are distinct:
+    the path names both, but never implies the policy itself caused the refusal."""
+    decision = {
+        "eligible": False,
+        "policy_id": "AU_BOOKLY_EXTENDED_RETURN",
+        "product_type": "PhysicalBook",
+        "region": "AU",
+        "return_window_days": 45,
+        "existing_return_id": "RET-5001",
+    }
+
+    assert ui.format_policy_path(decision) == (
+        "PhysicalBook + AU → AU_BOOKLY_EXTENDED_RETURN (45 days) "
+        "→ Existing return: RET-5001 → Not eligible"
+    )
+
+
+def test_a_refusal_with_no_policy_has_no_path_to_show() -> None:
+    """A refusal that never reached a policy — a bad order or item — has nothing
+    to name, so the path is empty rather than a bare 'Not eligible'."""
+    assert ui.policy_path_steps({"eligible": False}) == []
+    assert ui.format_policy_path({"eligible": False}) == ""
+
+
+# =========================================================================
 # Traces belong to the turn that caused them
 # =========================================================================
 
@@ -422,6 +491,8 @@ def test_a_decision_travels_on_the_call_that_made_it() -> None:
             policy_id="STANDARD_30_DAY",
             explanation="Inside the window.",
             rule_path=STANDARD_PATH,
+            product_type="PhysicalBook",
+            return_window_days=30,
             eligibility_token="elig-secret",
             days_remaining=12,
         )
@@ -431,6 +502,10 @@ def test_a_decision_travels_on_the_call_that_made_it() -> None:
         "eligible": True,
         "policy_id": "STANDARD_30_DAY",
         "rule_path": STANDARD_PATH,
+        "product_type": "PhysicalBook",
+        "region": None,
+        "return_window_days": 30,
+        "existing_return_id": None,
         "days_remaining": 12,
     }
     # The token is a credential, and the explanation is already the reply.
@@ -549,7 +624,7 @@ def test_the_eligibility_turn_shows_the_policy_and_the_path(
     assert decision is not None
     assert decision["policy_id"] == "STANDARD_30_DAY"
     assert decision["eligible"] is True
-    assert ui.format_rule_path(decision["rule_path"]) == "PhysicalBook → STANDARD_30_DAY"
+    assert ui.format_policy_path(decision) == "PhysicalBook → STANDARD_30_DAY (30 days) → Eligible"
     # The earlier turns explain nothing about policy, and must not claim to.
     assert all(t.policy_decision is None for turn in turns[:-1] for t in turn.tool_traces)
 
@@ -590,7 +665,7 @@ def test_the_outside_window_turn_shows_a_refusal_with_its_policy(
     assert decision is not None
     assert ui.decision_label(decision["eligible"]) == "Not eligible"
     assert decision["policy_id"] == "STANDARD_30_DAY"
-    assert ui.format_rule_path(decision["rule_path"]) == "PhysicalBook → STANDARD_30_DAY"
+    assert ui.format_policy_path(decision) == "PhysicalBook → STANDARD_30_DAY (30 days) → Not eligible"
 
 
 def test_two_checks_in_one_turn_keep_their_own_decisions(make_agent, seeded_graph) -> None:
@@ -614,13 +689,18 @@ def test_two_checks_in_one_turn_keep_their_own_decisions(make_agent, seeded_grap
 
     assert book.policy_decision["policy_id"] == "AU_BOOKLY_EXTENDED_RETURN"
     assert ui.decision_label(book.policy_decision["eligible"]) == "Eligible"
-    assert ui.format_rule_path(book.policy_decision["rule_path"]).startswith(
-        "PhysicalBook → AU_BOOKLY_EXTENDED_RETURN"
+    assert ui.format_policy_path(book.policy_decision) == (
+        "PhysicalBook + AU → AU_BOOKLY_EXTENDED_RETURN (45 days) → Eligible"
     )
 
     assert ebook.policy_decision["policy_id"] == "DIGITAL_NO_RETURN"
     assert ui.decision_label(ebook.policy_decision["eligible"]) == "Not eligible"
-    assert ui.format_rule_path(ebook.policy_decision["rule_path"]) == "EBook → DIGITAL_NO_RETURN"
+    assert ui.format_policy_path(ebook.policy_decision) == "EBook → DIGITAL_NO_RETURN → Not eligible"
+
+    # Each item's path is built from its own call — the ebook's decision never
+    # borrows the physical book's region, policy, or window.
+    assert "AU_BOOKLY_EXTENDED_RETURN" not in ui.format_policy_path(ebook.policy_decision)
+    assert "AU" not in (ebook.policy_decision.get("region") or "")
 
     # The turn-level decision is the ebook's, and it did not overwrite the first.
     assert state.eligibility.policy_id == "DIGITAL_NO_RETURN"
@@ -1062,8 +1142,9 @@ def test_the_hero_flow_shows_both_tiers_where_the_router_chose_them(app, hero_sc
     ]
 
 
-def test_the_eligibility_trace_shows_the_policy_and_the_graph_path(app, hero_script) -> None:
-    """The decision is explained by the traversal that produced it."""
+def test_the_eligibility_trace_shows_the_policy_and_the_decision_path(app, hero_script) -> None:
+    """The decision is explained by a business-friendly path, labelled 'Policy
+    path' — not the old 'Rule path' label, and not a flattened graph traversal."""
     at = run_hero_flow_in_ui(app(*hero_script))
 
     eligibility = next(b for b in traces(at) if "check_return_eligibility" in body(b))
@@ -1072,6 +1153,8 @@ def test_the_eligibility_trace_shows_the_policy_and_the_graph_path(app, hero_scr
     assert "Eligible" in shown
     assert "PhysicalBook" in shown
     assert "→ STANDARD_30_DAY" in shown
+    assert "Policy path" in shown
+    assert "Rule path" not in shown
 
 
 def test_the_traces_stay_attached_to_the_right_replies(app, hero_script) -> None:
@@ -1137,6 +1220,8 @@ def test_the_outside_window_case_needs_no_special_display(app) -> None:
     assert "Sonnet" in page_text(at)
     assert "Not eligible" in shown
     assert "STANDARD_30_DAY" in shown
+    assert "Policy path" in shown
+    assert "Rule path" not in shown
     assert "→ STANDARD_30_DAY" in shown
     assert at.session_state["bookly_state"].pending_returns == []
 
