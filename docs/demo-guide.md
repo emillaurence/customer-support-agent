@@ -46,7 +46,7 @@ Expected outcome:
 What to point out:
 - Both eligibility decisions come from the same policy resolver, evaluated independently per item.
 - One ineligible result in the same turn does not overwrite or cancel the eligible one.
-- The Agent Trace shows each `check_return_eligibility` call with its own policy id and rule path.
+- The Agent Trace shows each `check_return_eligibility` call with its own policy id and policy path.
 
 ## Scenario 3: Multiple eligible returns
 
@@ -68,7 +68,7 @@ For each scenario, expand the "Agent trace" panel under the assistant's reply an
 
 - **Model tier** — Haiku for the plain lookup, Sonnet once return intent, ambiguity, or a pending confirmation is in play — and the one-line routing reason.
 - **Tool calls, in order** — name, sanitized arguments, status (success / blocked / rejected / failed), and latency.
-- **Policy decision** — for `check_return_eligibility`, the policy id, eligible/not eligible, and the rule path (the graph hops behind the decision).
+- **Policy decision** — for `check_return_eligibility`, the policy id, eligible/not eligible, and the policy path (input context → applicable policy → blocker, if any → final decision).
 - **Mutation result** — for `initiate_return`, the RMA reference and whether it was newly created.
 
 Nothing sensitive is shown: emails are masked to their first character and domain, and eligibility tokens never appear in the trace or the reply, only inside the server-side state that enforces them.

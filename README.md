@@ -35,25 +35,28 @@ Customer
 Streamlit UI
    ↓
 Bookly Agent
-   ├─ Haiku / Sonnet routing
-   ├─ conversation + clarification
+   ├─ Prompt         (behaviour + boundaries)
+   ├─ Routing        (Haiku / Sonnet)
+   ├─ Memory         (trusted state outside the model)
+   ├─ Orchestration  (LLM-directed tool loop)
    └─ six explicit tools
           ↓
-   Trusted Python controls
-   ├─ identity
-   ├─ ownership
-   ├─ policy / eligibility
+   Deterministic Controls
+   ├─ identity & ownership
+   ├─ policy & eligibility
    ├─ confirmation
-   └─ mutations
+   └─ idempotency
           ↓
-      JSON + Neo4j
+   Data & Policy Sources
+   ├─ transactional JSON data
+   └─ Neo4j policy graph
 ```
 
 - One agent, not a multi-agent system.
 - Six explicit, model-callable tools — nothing else is reachable.
-- Neo4j is the runtime policy source of truth for return rules and eligibility.
+- Neo4j is the shared policy truth — the runtime source of both policy answers and eligibility decisions.
 - A trusted `SessionState` keeps mutation-critical state (identity, tokens, confirmation) outside the model's reach.
-- The Agent Trace panel shows model routing, tool calls, latency, and policy decisions — operational visibility, not chain-of-thought.
+- The Agent Trace panel shows model, route, tools, latency, and policy path — operational visibility, not chain-of-thought.
 
 [Read the detailed architecture](docs/architecture.md)
 
