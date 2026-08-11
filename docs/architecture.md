@@ -87,11 +87,17 @@ The JSON schema shown to the model is deliberately narrower than the Python func
 
 Every trusted field is written in exactly one place — `apply_tool_result` — and only from a tool call that returned `ToolStatus.OK`. A blocked guard, a rejected call, or a failed one leaves state untouched. This is session-scoped, in-memory state held for the life of one Streamlit tab — not durable production memory, and not a customer profile store.
 
-## 6. Data & Policy Sources: Neo4j as shared policy truth
+## 6. Data & Policy Sources: Transactional State + Shared Policy Truth
 
-Neo4j is the shared policy truth — the single runtime source both tools resolve against (`policy/graph.py`, `policy/policy.py`). Categories (`PhysicalBook`, `EBook`) are governed by policies; regions can override into a more specific policy for their customers; policies can outrank one another by precedence. Both `search_policy` (informational) and `check_return_eligibility` (transactional) resolve through the same `applicable_policies` function, so an answer about "what's the return window in Australia" and a decision on an actual Australian customer's order cannot disagree — a bug class the shared resolver was written specifically to close. The same resolution logic backs an informational FAQ answer and a customer-specific eligibility decision; there is one policy truth, not two.
+Bookly uses two distinct data sources because they answer different questions.
 
-There is no JSON fallback. If Neo4j is unconfigured or unreachable, the tools raise `PolicyGraphUnavailableError` and the agent tells the customer it can't confirm the policy right now rather than answering from a guess or a stale fixture. `neo4j/policy_graph.json` and `neo4j/seed.cypher` are fixtures for `neo4j/ingest.py` to load at setup time — nothing at runtime reads them directly.
+**Transactional data** lives in mocked JSON stores and represents the operational state of the bookstore: customers, orders, items, and returns. Tools such as `verify_identity` and `lookup_order` read from this data to establish who the customer is, what they own, what was delivered, and whether an item already has an open return. `initiate_return` is the only tool that mutates this state by creating a return record.
+
+**Policy data** lives in Neo4j (`policy/graph.py`, `policy/policy.py`) and is the runtime source of truth for return rules. Categories (`PhysicalBook`, `EBook`) are governed by policies; regions can override into a more specific policy for their customers; policies can outrank one another by precedence. Both `search_policy` (informational) and `check_return_eligibility` (transactional) resolve through the same `applicable_policies` function, so an answer about "what's the return window in Australia" and a decision on an actual Australian customer's order cannot disagree — a bug class the shared resolver was written specifically to close. There is one policy truth, not two.
+
+The two sources come together during eligibility. Transactional data establishes the **customer, order, item, delivery state, and existing return state**; Neo4j determines the **applicable policy and regional override**. Deterministic Python combines those inputs to produce the final eligibility decision and, when eligible, stores the trusted item-scoped eligibility token server-side.
+
+There is no JSON fallback for policy. If Neo4j is unconfigured or unreachable, the tools raise `PolicyGraphUnavailableError` and the agent tells the customer it can't confirm the policy right now rather than answering from a guess or a stale fixture. `neo4j/policy_graph.json` and `neo4j/seed.cypher` are fixtures for `neo4j/ingest.py` to load at setup time — nothing at runtime reads them directly.
 
 ## 7. Prompt boundary
 
