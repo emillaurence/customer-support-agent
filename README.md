@@ -107,7 +107,7 @@ Deterministic Python controls:
 
 identity collection, automatic order discovery once verified, and a clarifying question only when the item is genuinely ambiguous.
 
-GIF: `docs/assets/demos/order-discovery.gif` *(add the recording to see it rendered here)*
+![Order discovery and clarification](docs/assets/demos/order-discovery.gif)
 
 ### 2. Mixed eligibility
 

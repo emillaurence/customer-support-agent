@@ -38,7 +38,9 @@ Expected flow:
 
 **Trust/control behaviour:** identity is verified before any order data is returned; order discovery and clarification are handled deterministically, not guessed by the model.
 
-**GIF:** `assets/demos/order-discovery.gif`
+**GIF:**
+
+![Order discovery and clarification](assets/demos/order-discovery.gif)
 
 ## 2. Mixed eligibility
 
