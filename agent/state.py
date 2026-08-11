@@ -208,6 +208,28 @@ class ModelTurn(BaseModel):
         default=0, description="Prefix served from the cache. The saving."
     )
 
+    # Latency, measured where it happens rather than estimated afterwards — see
+    # `agent.agent._run_tool_loop_stream`, the only writer of these three.
+    model_latency_ms: float = Field(
+        default=0.0, description="Time spent inside Anthropic calls, summed over this turn."
+    )
+    tool_latency_ms: float = Field(
+        default=0.0, description="Time spent inside tool calls, summed over this turn."
+    )
+    total_latency_ms: float = Field(
+        default=0.0, description="Wall-clock time for the whole turn, model and tools together."
+    )
+    time_to_first_token_ms: float | None = Field(
+        default=None,
+        description=(
+            "How long the customer waited before the first visible character. None "
+            "means nothing was ever streamed to them — an outage before any text arrived."
+        ),
+    )
+    timed_out: bool = Field(
+        default=False, description="True when the turn stopped because of TURN_TIMEOUT_SECONDS."
+    )
+
 
 MAX_SUMMARY_CHARS = 200
 

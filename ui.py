@@ -167,6 +167,16 @@ class AssistantTurn(BaseModel):
         default_factory=list, description="The tools this turn ran, in execution order."
     )
 
+    # Latency, carried over from `ModelTurn` rather than re-measured here — this
+    # module renders, it does not time anything. See `agent.state.ModelTurn` for
+    # what each one means; `iterations` is the round trips this turn made.
+    iterations: int = 0
+    total_latency_ms: float = 0.0
+    model_latency_ms: float = 0.0
+    tool_latency_ms: float = 0.0
+    time_to_first_token_ms: float | None = None
+    timed_out: bool = False
+
     @property
     def tool_names(self) -> list[str]:
         return [trace.tool_name for trace in self.tool_traces]
@@ -186,6 +196,12 @@ def capture_turn(state: SessionState, reply: str, *, trace_offset: int) -> Assis
         model_tier=turn.model_tier if turn else "",
         routing_reason=turn.routing_reason if turn else "",
         tool_traces=list(state.tool_traces[trace_offset:]),
+        iterations=turn.iterations if turn else 0,
+        total_latency_ms=turn.total_latency_ms if turn else 0.0,
+        model_latency_ms=turn.model_latency_ms if turn else 0.0,
+        tool_latency_ms=turn.tool_latency_ms if turn else 0.0,
+        time_to_first_token_ms=turn.time_to_first_token_ms if turn else None,
+        timed_out=turn.timed_out if turn else False,
     )
 
 
@@ -280,6 +296,51 @@ def format_latency(latency_ms: float) -> str:
     if latency_ms >= 10:
         return f"{round(latency_ms)} ms"
     return f"{latency_ms:.1f} ms"
+
+
+def latency_summary(turn: AssistantTurn) -> str:
+    """One line proving the turn was fast, or saying why it was not.
+
+    Three numbers, each answering a distinct question a reviewer would ask:
+    how long before anything appeared (`time_to_first_token_ms` — the first
+    user-visible assistant text, not the first Anthropic response), how long
+    the whole turn took (`total_latency_ms`), and how many Anthropic model
+    calls it took (`iterations`). Cumulative model and tool time are not
+    shown here — they read as single-call durations even when a turn made
+    several calls, which is misleading at a glance. Tool time stays visible
+    beside each tool's own trace; model time, when more than one call was
+    made, is available via `round_trip_breakdown` as secondary text. A
+    timed-out turn says so, since a fallback that reads like any other reply
+    would hide the one thing this line exists to surface.
+    """
+    parts = []
+    if turn.time_to_first_token_ms is not None:
+        parts.append(f"{format_latency(turn.time_to_first_token_ms)} to first text")
+    parts.append(f"{format_latency(turn.total_latency_ms)} total")
+    parts.append(f"{turn.iterations} model call{'s' if turn.iterations != 1 else ''}")
+    line = "Timing · " + " · ".join(parts)
+    return f"{line} · timed out" if turn.timed_out else line
+
+
+def round_trip_breakdown(turn: AssistantTurn) -> str | None:
+    """Secondary diagnostic text for a multi-call turn: the elapsed time of each
+    Anthropic model call, in call order, e.g. `"Model calls · 5.8s + 1.2s"`.
+
+    Only shown when per-call latencies were actually recorded and there is more
+    than one — a single call has nothing to break down, and this never estimates
+    a split that was not measured. The rounded sum reconciles with
+    `model_latency_ms`, subject to the same rounding `format_latency` always has.
+
+    `round_trip_latencies_ms` is read defensively (`getattr`, not a field on
+    `AssistantTurn`) because nothing in the loop records individual call
+    latencies today — only their sum, `model_latency_ms`. This returns `None`
+    until that per-call recording exists; it does not synthesize a split from
+    the aggregate.
+    """
+    latencies = getattr(turn, "round_trip_latencies_ms", None)
+    if not latencies or len(latencies) < 2:
+        return None
+    return "Model calls · " + " + ".join(format_latency(ms) for ms in latencies)
 
 
 def status_label(status: ToolStatus | str) -> str:
@@ -478,6 +539,9 @@ def render_trace(turn: AssistantTurn) -> None:
         # renames it for reading; this is the one the router actually recorded.
         st.markdown(f"**Model** · {tier_label(turn.model_tier)} · `{turn.model or '—'}`")
         st.caption(f"Routing · {turn.routing_reason or '—'}")
+        st.caption(latency_summary(turn))
+        if breakdown := round_trip_breakdown(turn):
+            st.caption(breakdown)
         for position, trace in enumerate(turn.tool_traces, start=1):
             render_tool_trace(trace, position=position)
 

@@ -294,6 +294,50 @@ class FakeMessages:
         assert self._responses, "the agent asked for more model responses than the script provides"
         return self._responses.pop(0)
 
+    def stream(self, **kwargs: Any) -> FakeMessageStream:
+        """The streaming entry point, alongside `create`.
+
+        The agent calls this one exclusively now, so it has to record the
+        request and pick the next scripted response exactly as `create` does —
+        it just hands the response back wrapped for incremental reading instead
+        of all at once. An error is raised immediately, on `__enter__`, the same
+        place the real SDK raises one: before any text could have streamed.
+        """
+        response = self.create(**kwargs)
+        return FakeMessageStream(response)
+
+
+class FakeMessageStream:
+    """A stand-in for `anthropic.MessageStreamManager`.
+
+    Offline tests have no real deltas to replay, so a scripted response's text
+    is split into a few word-sized chunks — enough to prove the agent relays
+    chunks as they arrive rather than buffering the whole reply — and the
+    unmodified response is still what `get_final_message` returns, so tool
+    execution and transcript handling see exactly what they would from a real
+    stream.
+    """
+
+    def __init__(self, response: FakeResponse) -> None:
+        self._response = response
+
+    def __enter__(self) -> FakeMessageStream:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    @property
+    def text_stream(self):
+        for block in self._response.content:
+            if getattr(block, "type", "") == "text" and block.text:
+                words = block.text.split(" ")
+                for index, word in enumerate(words):
+                    yield word if index == len(words) - 1 else f"{word} "
+
+    def get_final_message(self) -> FakeResponse:
+        return self._response
+
 
 class FakeAnthropic:
     """A stand-in Anthropic client that replays a script."""
@@ -401,16 +445,9 @@ def hero_script():
             block_id="toolu_elig",
         ),
         text(CONFIRM_QUESTION),
-        # Turn 5 — confirmed, so the write happens.
-        tool_call(
-            "initiate_return",
-            {
-                "order_id": IN_WINDOW_ORDER,
-                "item_id": IN_WINDOW_ITEM,
-                "reason": "Not what I expected.",
-            },
-            block_id="toolu_write",
-        ),
+        # Turn 5 — confirmed. The write happens deterministically, before this
+        # response is even asked for — see `_auto_initiate_confirmed_returns` —
+        # so this is only ever asked to compose the reply.
         text("Your return is open. You'll get an email with the next steps."),
     )
 

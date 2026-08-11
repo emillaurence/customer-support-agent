@@ -117,11 +117,16 @@ def run_turn(agent: BooklyAgent, state: SessionState, prompt: str) -> None:
     """Take one customer message through the agent and record what it did.
 
     The trace offset is read *before* the turn, so everything the loop appends
-    while it runs belongs to this turn.
+    while it runs belongs to this turn. Rendered as it streams — `st.write_stream`
+    draws each chunk `agent.respond_stream` yields as it arrives and hands back
+    the same joined string `agent.respond` would have returned — so the customer
+    sees the reply build up rather than waiting behind a spinner for the whole
+    turn, tool calls included, to finish first.
     """
     offset = len(state.tool_traces)
     try:
-        reply = agent.respond(state, prompt)
+        with st.chat_message("assistant"):
+            reply = st.write_stream(agent.respond_stream(state, prompt))
     except Exception:  # noqa: BLE001 - a customer must never meet a stack trace
         st.session_state.turn_error = UNAVAILABLE
         return
@@ -191,8 +196,9 @@ def main() -> None:
     if prompt := st.chat_input(ui.CHAT_PLACEHOLDER):
         with st.chat_message("user"):
             st.markdown(prompt)
-        with st.spinner("Working on it…"):
-            run_turn(agent, state, prompt)
+        # No spinner: the reply itself, streaming in as `run_turn` renders it, is
+        # the feedback that the agent is working.
+        run_turn(agent, state, prompt)
         # The page was drawn before this turn ran; rerun so the reply, its trace,
         # and the session view all reflect it.
         st.rerun()

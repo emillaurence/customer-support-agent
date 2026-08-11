@@ -105,6 +105,88 @@ def test_latency_is_readable_at_every_scale(latency_ms: float, expected: str) ->
     assert ui.format_latency(latency_ms) == expected
 
 
+def test_single_call_turn_reads_one_model_call() -> None:
+    """No plural where there is only one call, and the singular is correct."""
+    turn = ui.AssistantTurn(
+        reply="ok", iterations=1, total_latency_ms=1800.0, time_to_first_token_ms=1400.0,
+    )
+    assert "1 model call" in ui.latency_summary(turn)
+    assert "1 model calls" not in ui.latency_summary(turn)
+
+
+def test_multi_call_turn_reads_n_model_calls() -> None:
+    turn = ui.AssistantTurn(
+        reply="ok", iterations=2, total_latency_ms=7300.0, time_to_first_token_ms=6100.0,
+    )
+    assert "2 model calls" in ui.latency_summary(turn)
+
+
+def test_the_primary_line_names_first_text_total_and_call_count() -> None:
+    """The three numbers a reviewer needs, and nothing measured elsewhere in the
+    turn — `time_to_first_token_ms` is when the customer's first character
+    appeared, not when the first Anthropic call returned, so the label says
+    "first text" rather than "first response"."""
+    turn = ui.AssistantTurn(
+        reply="ok", iterations=2, total_latency_ms=7300.0, time_to_first_token_ms=6100.0,
+        model_latency_ms=7000.0, tool_latency_ms=300.0,
+    )
+    line = ui.latency_summary(turn)
+    assert "to first text" in line
+    assert "7.3 s total" in line
+    assert "2 model calls" in line
+
+
+def test_the_primary_line_drops_the_aggregate_model_and_tool_time() -> None:
+    """Cumulative model and tool time read as a single call's duration even when
+    the turn made several — the top line drops them; tool time stays on each
+    tool's own trace, and model time (when it says anything a single number
+    can't) moves to `round_trip_breakdown`."""
+    turn = ui.AssistantTurn(
+        reply="ok", iterations=2, total_latency_ms=7300.0, time_to_first_token_ms=6100.0,
+        model_latency_ms=7000.0, tool_latency_ms=300.0,
+    )
+    line = ui.latency_summary(turn)
+    assert "model" not in line.lower() or "model call" in line
+    assert "tool" not in line.lower()
+    assert "round trip" not in line.lower()
+
+
+def test_first_text_is_omitted_when_never_measured() -> None:
+    """A turn that never streamed anything says so by omission, not by printing
+    a latency that was never recorded."""
+    turn = ui.AssistantTurn(reply="ok", iterations=1, total_latency_ms=500.0)
+    line = ui.latency_summary(turn)
+    assert "to first text" not in line
+    assert "500 ms total" in line
+
+
+def test_a_timed_out_turn_still_says_so() -> None:
+    turn = ui.AssistantTurn(reply="ok", iterations=1, total_latency_ms=500.0, timed_out=True)
+    assert ui.latency_summary(turn).endswith("timed out")
+
+
+def test_no_breakdown_line_when_only_one_call_was_made() -> None:
+    """A single call has nothing to break down."""
+    turn = ui.AssistantTurn(reply="ok", iterations=1, model_latency_ms=1800.0)
+    assert ui.round_trip_breakdown(turn) is None
+
+
+def test_no_breakdown_line_when_per_call_latency_was_never_recorded() -> None:
+    """The loop only sums call latencies into `model_latency_ms` today — it does
+    not keep each call's own duration. Without that, the breakdown must not
+    invent a split from the aggregate."""
+    turn = ui.AssistantTurn(reply="ok", iterations=2, model_latency_ms=7000.0)
+    assert ui.round_trip_breakdown(turn) is None
+
+
+def test_breakdown_line_uses_the_recorded_per_call_latencies_verbatim() -> None:
+    """When per-call latencies are available, the breakdown reports exactly what
+    was recorded, in call order, and the rounded values sum to `model_latency_ms`."""
+    turn = ui.AssistantTurn(reply="ok", iterations=2, model_latency_ms=7000.0)
+    object.__setattr__(turn, "round_trip_latencies_ms", [5800.0, 1200.0])
+    assert ui.round_trip_breakdown(turn) == "Model calls · 5.8 s + 1.2 s"
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [

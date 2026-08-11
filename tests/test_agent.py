@@ -1011,27 +1011,38 @@ def test_yes_after_a_statement_does_not_confirm(make_agent, seeded_graph, verifi
 
 def test_yes_after_an_explicit_request_confirms(make_agent, seeded_graph, verified_state) -> None:
     """The path that is allowed to work: eligibility passed, the agent asked a
-    direct question, the customer said yes — and only for this order and item."""
+    direct question, the customer said yes — and only for this order and item.
+
+    Confirming and opening the return are one pass: once Python has judged the
+    "yes" genuine, there is nothing left for Claude to decide, so the write
+    happens before Claude is asked anything — see
+    `_auto_initiate_confirmed_returns` — and Claude's one round trip this turn
+    is spent composing the reply, not asking for the tool.
+    """
     agent, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM}),
         text(CONFIRM_QUESTION),
     )
     agent.respond(verified_state, "I'd like to return the paperback")
 
-    agent2, _ = make_agent(text("Done — your return is open."))
+    agent2, client2 = make_agent(text("Done — your return is open."))
     agent2.respond(verified_state, "yes please")
 
-    assert verified_state.may_mutate is True
-    assert len(verified_state.pending_returns) == 1
-    assert verified_state.pending_returns[0].confirmed is True
-    assert verified_state.pending_returns[0].order_id == IN_WINDOW_ORDER
+    assert verified_state.may_mutate is False
+    assert verified_state.pending_returns == []
+    write = verified_state.tool_traces[-1]
+    assert write.tool_name == "initiate_return"
+    assert write.status is ToolStatus.OK
+    assert write.tool_args["order_id"] == IN_WINDOW_ORDER
+    assert len(client2.calls) == 1  # composing the reply — no round trip spent asking for the write
 
 
 def test_confirmed_return_can_be_opened(make_agent, seeded_graph, verified_state) -> None:
     """With all three gates satisfied, the write goes through.
 
-    The model never supplies the token or the confirmation — it asks to open a
-    return for an order and item, and the loop passes the trusted values in.
+    The model never supplies the token or the confirmation — it never even asks
+    for `initiate_return`: Python opens it the moment the "yes" is judged
+    genuine, and Claude's only round trip this turn composes the reply.
     """
     agent, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM}),
@@ -1040,10 +1051,6 @@ def test_confirmed_return_can_be_opened(make_agent, seeded_graph, verified_state
     agent.respond(verified_state, "I want to return the paperback, it arrived damaged")
 
     agent2, _ = make_agent(
-        tool_call(
-            "initiate_return",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM, "reason": "arrived damaged"},
-        ),
         text("Your return is open — you'll get an email with the next steps."),
     )
     agent2.respond(verified_state, "yes please")
@@ -1060,25 +1067,38 @@ def test_confirmed_return_can_be_opened(make_agent, seeded_graph, verified_state
 def test_confirmation_does_not_survive_an_item_switch(
     make_agent, seeded_graph, verified_state
 ) -> None:
-    """A yes given for one book cannot open a return for another."""
+    """A question asked about one book cannot be answered by naming another.
+
+    A genuine "yes" is now spent the instant it is judged genuine — see
+    `_auto_initiate_confirmed_returns` — so there is no longer a window where a
+    confirmed-but-unwritten return sits waiting for a later turn to spend. What
+    still has to hold is the step before that: naming a different item clears
+    whatever was asked about the first, so a "yes" after the switch answers
+    nothing.
+    """
     agent, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM}),
         text(CONFIRM_QUESTION),
     )
     agent.respond(verified_state, "return the paperback please")
+    assert verified_state.may_mutate is False  # asked, not yet answered
 
-    agent2, _ = make_agent(text("Which one did you mean?"))
-    agent2.respond(verified_state, "yes")
-    assert verified_state.may_mutate is True
-
-    agent3, _ = make_agent(
+    agent2, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": EXPIRED_ORDER, "item_id": EXPIRED_ITEM}),
         text("That one's outside the return window, I'm afraid."),
     )
-    agent3.respond(verified_state, "actually I meant the one from ORD-1002")
+    agent2.respond(verified_state, "actually I meant the one from ORD-1002")
 
     assert verified_state.may_mutate is False
     assert verified_state.pending_returns == []
+
+    # The only question ever asked was about the paperback, and the switch
+    # dropped it — so a bare "yes" now has nothing to confirm and opens nothing.
+    agent3, _ = make_agent(text("There's nothing open for me to confirm right now."))
+    agent3.respond(verified_state, "yes")
+
+    assert verified_state.pending_returns == []
+    assert "initiate_return" not in tool_names(verified_state)
 
 
 # =========================================================================
@@ -1554,7 +1574,9 @@ def test_confirming_after_a_multi_item_check_opens_the_return_immediately(
     """The scenario that used to escalate: "yes" after checking two items must
     confirm and open the return in one pass — no blocked confirmed=False call,
     no repeated confirmation, and no human escalation for what was a session
-    bug rather than a real failure."""
+    bug rather than a real failure. It opens before Claude is even asked a
+    second time now, so the confirming turn's only round trip composes the
+    reply rather than requesting the write."""
     agent, _ = make_agent(
         tool_calls(
             ("check_return_eligibility", {"order_id": EBOOK_ORDER, "item_id": PHYSICAL_ITEM}),
@@ -1563,9 +1585,6 @@ def test_confirming_after_a_multi_item_check_opens_the_return_immediately(
         text(
             "The physical book can be returned; the ebook can't. Would you like "
             "me to start the return for A Short History of Nearly Everything?"
-        ),
-        tool_call(
-            "initiate_return", {"order_id": EBOOK_ORDER, "item_id": PHYSICAL_ITEM}, block_id="toolu_write"
         ),
         text("Your return is open. You'll get an email with the next steps."),
     )
@@ -1636,7 +1655,9 @@ def test_two_eligible_items_with_no_selection_stay_pending_but_unconfirmed(
 def test_kenji_multi_item_return_end_to_end(make_agent, seeded_graph) -> None:
     """The scenario that used to escalate: two eligible items, confirmed together
     with one "both", must open two returns — no blocked call, no repeated
-    confirmation, and no escalation for what was a session-state bug."""
+    confirmation, and no escalation for what was a session-state bug. Both
+    writes happen deterministically, before Claude is asked to compose the
+    reply, so confirming "both" costs one round trip rather than two."""
     state = SessionState()
 
     agent, _ = make_agent(
@@ -1663,14 +1684,13 @@ def test_kenji_multi_item_return_end_to_end(make_agent, seeded_graph) -> None:
     assert len(state.pending_returns) == 2
     assert not any(pending.confirmed for pending in state.pending_returns)
 
-    agent3, _ = make_agent(
-        tool_calls(
-            ("initiate_return", {"order_id": KENJI_ORDER_B, "item_id": KENJI_ITEM_B}),
-            ("initiate_return", {"order_id": KENJI_ORDER_A, "item_id": KENJI_ITEM_A}),
-        ),
-        text("Both returns are open. You'll get emails with the next steps."),
-    )
+    agent3, client3 = make_agent(text("Both returns are open. You'll get emails with the next steps."))
     agent3.respond(state, "yes please")
+
+    # Both writes happen before Claude is asked anything this turn — see
+    # `_auto_initiate_confirmed_returns` — so composing the reply is the only
+    # round trip the confirming turn spends.
+    assert len(client3.calls) == 1
 
     assert tool_names(state) == [
         "verify_identity",
@@ -2024,11 +2044,6 @@ def test_a_confirmed_return_is_not_held_up_for_a_reason(
     agent, _ = make_agent(
         tool_call("check_return_eligibility", {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM}),
         text(CONFIRM_QUESTION),
-        tool_call(
-            "initiate_return",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
-            block_id="toolu_write",
-        ),
         text("Your return is open."),
     )
 
@@ -2044,7 +2059,8 @@ def test_a_confirmed_return_is_not_held_up_for_a_reason(
 def test_a_reason_given_earlier_is_not_asked_for_again(
     make_agent, seeded_graph, verified_state, data_dir
 ) -> None:
-    """The model omits the reason on the write. The session already holds it, so
+    """The write, auto-initiated on confirmation, never supplies a reason of its
+    own. The session already holds the one given at the eligibility check, so
     it is filled in from there rather than lost or re-requested."""
     agent, _ = make_agent(
         tool_call(
@@ -2056,11 +2072,6 @@ def test_a_reason_given_earlier_is_not_asked_for_again(
             },
         ),
         text(CONFIRM_QUESTION),
-        tool_call(
-            "initiate_return",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM},
-            block_id="toolu_write",
-        ),
         text("Your return is open."),
     )
 
@@ -2174,11 +2185,6 @@ def test_confirmation_phrasings_work_in_a_pending_context(
             {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM, "reason": "Not for me."},
         ),
         text(CONFIRM_QUESTION),
-        tool_call(
-            "initiate_return",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM, "reason": "Not for me."},
-            block_id="toolu_write",
-        ),
         text("Your return is open."),
     )
     agent.respond(hero_verified, "I'd like to return it")

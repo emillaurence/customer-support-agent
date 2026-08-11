@@ -25,6 +25,7 @@ import os
 import time
 import types
 import uuid
+from collections.abc import Iterator
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -520,6 +521,23 @@ never retried. `initiate_return` is idempotent on top of that, so even a
 duplicate request cannot open a second RMA.
 """
 
+TURN_TIMEOUT_SECONDS = 20.0
+"""Aggregate wall-clock budget for one whole turn — every round trip and every
+tool call it takes, not just one Anthropic call.
+
+`REQUEST_TIMEOUT_SECONDS` and `MAX_RETRIES` bound a single call; nothing bounded
+the turn they compound across until this. Six iterations, each retried twice at
+thirty seconds, is nine minutes a customer could otherwise be left waiting
+behind. Checked once at the top of every loop iteration — never mid-call and
+never mid-tool, so a call already in flight always finishes and a mutation that
+has already committed is never the thing interrupted.
+
+Comfortably above a normal multi-tool turn (verify, look up, check eligibility,
+confirm — four or five round trips of a second or two each) and comfortably
+below the worst case above, so a turn that is genuinely stuck fails fast rather
+than compounding to it.
+"""
+
 CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 """Turn on Anthropic's automatic prompt caching, at the request level.
 
@@ -580,15 +598,33 @@ class BooklyAgent:
         self.clock = clock
 
     def respond(self, state: SessionState, user_message: str) -> str:
-        """Take one user turn and produce one assistant reply.
+        """Take one user turn and produce one assistant reply, as one value.
 
-        Mutates `state` in place. Always returns something sayable: an outage or a
-        stuck loop produces an honest message, never an exception and never a
-        fabricated success.
+        A thin wrapper over `respond_stream`, for a caller — a test, a script,
+        anything not rendering to a screen as it goes — that wants the turn as
+        one string rather than as the pieces `respond_stream` yields. Mutates
+        `state` exactly as `respond_stream` does, since this is that generator,
+        drained. Always returns something sayable: an outage, a stuck loop, or
+        an aggregate timeout produce an honest message, never an exception and
+        never a fabricated success.
         """
-        # Confirmation is read before the model sees the message, and from the
-        # state as it was when the agent asked its question. Doing it here means a
-        # "yes" is judged against what was actually pending.
+        return "".join(self.respond_stream(state, user_message))
+
+    def respond_stream(self, state: SessionState, user_message: str) -> Iterator[str]:
+        """Take one user turn and yield the assistant reply as it is produced.
+
+        Behaviourally identical to `respond` — same trusted-state updates, same
+        transcript, same final assistant message — except a caller reading this
+        as it runs sees customer-visible text as soon as Anthropic sends it,
+        rather than waiting for the whole turn (including every tool call) to
+        finish first. Concatenating every chunk yielded here is exactly the
+        string `respond` returns for the same turn.
+
+        Never yields a tool's arguments, a policy id, or anything from inside
+        the model's reasoning — nothing here is capable of that, since only
+        `text_stream` deltas are ever relayed, and no `thinking` content is
+        requested or read anywhere in this file.
+        """
         self._update_confirmation(state, user_message)
 
         state.add_message(Role.USER, user_message)
@@ -616,22 +652,70 @@ class BooklyAgent:
             decision.reason,
         )
 
-        # The loop owns `state.transcript` — every assistant turn it produces,
-        # including a fallback, is written there by the loop itself. Here we only
-        # mirror the reply into the visible transcript.
-        reply = self._run_tool_loop(state, decision, model_id, turn)
-        state.add_message(Role.ASSISTANT, reply)
-        return reply
+        turn_started = time.perf_counter()
+        chunks: list[str] = []
+        for chunk in self._run_tool_loop_stream(state, decision, model_id, turn, turn_started):
+            if turn.time_to_first_token_ms is None:
+                turn.time_to_first_token_ms = round((time.perf_counter() - turn_started) * 1000, 1)
+            chunks.append(chunk)
+            yield chunk
 
-    def _run_tool_loop(
-        self, state: SessionState, decision: ModelDecision, model_id: str, turn: ModelTurn
-    ) -> str:
-        """Call Anthropic, run whatever tools it asks for, repeat until it replies."""
+        turn.total_latency_ms = round((time.perf_counter() - turn_started) * 1000, 1)
+        state.add_message(Role.ASSISTANT, "".join(chunks))
+
+    def _run_tool_loop_stream(
+        self,
+        state: SessionState,
+        decision: ModelDecision,
+        model_id: str,
+        turn: ModelTurn,
+        turn_started: float,
+    ) -> Iterator[str]:
+        """Call Anthropic, run whatever tools it asks for, repeat until it
+        replies — yielding customer-visible text as Anthropic streams it.
+
+        Every iteration is one round trip: stream the response, run every tool
+        it asked for, feed the results back, and — unless this response also
+        asked for a tool — stop. A response with both text and a tool call
+        streams its text exactly as it arrives and then keeps going, so a
+        customer sees "Let me check that" before the lookup that follows it,
+        never after.
+        """
+        # A confirmed, tokened return needs nothing further decided — see
+        # `_auto_initiate_confirmed_returns` — so it is written before Claude is
+        # asked anything this turn rather than after Claude asks for it.
+        self._auto_initiate_confirmed_returns(state, decision, model_id, turn)
+
         for _ in range(MAX_TOOL_ITERATIONS):
+            # The aggregate budget, checked before starting another round trip
+            # and nowhere inside one: a call already in flight always finishes,
+            # and a tool that has already written something is never undone.
+            elapsed = time.perf_counter() - turn_started
+            if elapsed >= TURN_TIMEOUT_SECONDS:
+                turn.timed_out = True
+                self._trace(
+                    state,
+                    decision,
+                    model_id,
+                    tool_name="turn_timeout",
+                    tool_args={},
+                    status=ToolStatus.ERROR,
+                    latency_ms=0.0,
+                    summary=f"turn timeout exceeded ({TURN_TIMEOUT_SECONDS:.0f}s budget)",
+                    error=f"aggregate turn budget of {TURN_TIMEOUT_SECONDS:.0f}s exceeded after {elapsed:.1f}s",
+                )
+                LOG.error(
+                    "turn timeout=exceeded elapsed_s=%.1f budget_s=%.1f", elapsed, TURN_TIMEOUT_SECONDS
+                )
+                state.transcript.append(_assistant_text(FALLBACK_UNAVAILABLE))
+                yield FALLBACK_UNAVAILABLE
+                return
+
             turn.iterations += 1
+            model_started = time.perf_counter()
 
             try:
-                response = self.client.messages.create(
+                with self.client.messages.stream(
                     model=model_id,
                     max_tokens=MAX_TOKENS,
                     # Tools first, then the system prompt, then the conversation:
@@ -645,10 +729,16 @@ class BooklyAgent:
                     # Anthropic, so there is nowhere for a turn to be sampled
                     # differently. Omitted entirely unless a deployment set one.
                     **({} if self.config.temperature is None else {"temperature": self.config.temperature}),
-                )
+                ) as stream:
+                    # Only ever text deltas: tool_use arguments stream on a
+                    # different event the loop never reads here, and no
+                    # `thinking` block is requested anywhere in this file.
+                    yield from stream.text_stream
+                    response = stream.get_final_message()
             except Exception as exc:  # noqa: BLE001 - any API failure ends the turn safely
                 # Rate limit, outage, bad key, dropped connection. The customer
                 # gets one honest sentence; the transcript is left as it was.
+                turn.model_latency_ms += round((time.perf_counter() - model_started) * 1000, 1)
                 self._trace(
                     state,
                     decision,
@@ -664,20 +754,23 @@ class BooklyAgent:
                 )
                 LOG.error("model call=failed error=%s", type(exc).__name__)
                 state.transcript.append(_assistant_text(FALLBACK_UNAVAILABLE))
-                return FALLBACK_UNAVAILABLE
+                yield FALLBACK_UNAVAILABLE
+                return
 
+            turn.model_latency_ms += round((time.perf_counter() - model_started) * 1000, 1)
             _record_usage(turn, response)
             state.transcript.append({"role": "assistant", "content": _assistant_blocks(response)})
 
             tool_uses = [b for b in response.content if getattr(b, "type", "") == "tool_use"]
             if not tool_uses:
-                if text := _text_of(response):
-                    return text
+                if _text_of(response):
+                    return
                 # A turn with neither text nor a tool call. Rather than leave an
                 # empty assistant turn for the next turn to build on, replace it
                 # with what the customer will actually see.
                 state.transcript[-1] = _assistant_text(FALLBACK_EMPTY)
-                return FALLBACK_EMPTY
+                yield FALLBACK_EMPTY
+                return
 
             # Every tool Claude asked for runs, and all the results go back in one
             # user message — what the Messages API expects, and splitting them
@@ -688,7 +781,7 @@ class BooklyAgent:
             for block in tool_uses:
                 turn.tool_calls += 1
                 result, outcome = self._run_one_tool(
-                    state, decision, model_id, block, adopt_active_order
+                    state, decision, model_id, block, adopt_active_order, turn
                 )
                 results.append(result)
                 if getattr(block, "name", "") == "check_return_eligibility" and isinstance(
@@ -719,7 +812,7 @@ class BooklyAgent:
                     {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
                 )
                 result, _outcome = self._run_one_tool(
-                    state, decision, model_id, block, adopt_active_order
+                    state, decision, model_id, block, adopt_active_order, turn
                 )
                 results.append(result)
 
@@ -737,7 +830,61 @@ class BooklyAgent:
         # Out of iterations. Something is looping; say so rather than trying
         # again, and point at the escape hatch.
         state.transcript.append(_assistant_text(FALLBACK_STUCK))
-        return FALLBACK_STUCK
+        yield FALLBACK_STUCK
+
+    def _auto_initiate_confirmed_returns(
+        self, state: SessionState, decision: ModelDecision, model_id: str, turn: ModelTurn
+    ) -> None:
+        """Open every return the customer has already confirmed, before Claude
+        is asked anything this turn.
+
+        A pending return that is both `confirmed` and still holding its token has
+        nothing left for Claude to decide — the customer already said yes, in a
+        past turn Python already judged genuine, and the token proves a check
+        already said eligible. Waiting for Claude to notice that and ask for
+        `initiate_return` costs a full round trip it cannot change the outcome
+        of; a multi-item confirmation ("yes, both") costs one per item unless
+        Claude happens to batch them. Deciding *whether* to write was always
+        Python's job elsewhere in this file (`_update_confirmation`,
+        `initiate_return`'s own guards); running the call the moment that
+        decision is final is the same job, done without waiting to be asked.
+
+        Synthesizes the same tool_use/tool_result exchange Claude would have
+        produced — same handler, same guards, same trace — so Claude still sees
+        the result and still composes the reply; it simply sees it on the first
+        call it makes this turn instead of asking for it on an earlier one.
+        Nothing here is a new trust decision: `confirmed` and the token are
+        exactly what `initiate_return` re-checks on its own before it writes.
+        """
+        ready = [pending for pending in state.pending_returns if pending.confirmed and pending.eligibility_token]
+        if not ready:
+            return
+
+        blocks = [
+            types.SimpleNamespace(
+                id=f"toolu_auto_{uuid.uuid4().hex[:16]}",
+                name="initiate_return",
+                input={"order_id": pending.order_id, "item_id": pending.item_id},
+            )
+            for pending in ready
+        ]
+        state.transcript.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+                    for block in blocks
+                ],
+            }
+        )
+        results = []
+        for block in blocks:
+            turn.tool_calls += 1
+            result, _outcome = self._run_one_tool(
+                state, decision, model_id, block, adopt_active_order=True, turn=turn
+            )
+            results.append(result)
+        state.transcript.append({"role": "user", "content": results})
 
     def _run_one_tool(
         self,
@@ -746,6 +893,7 @@ class BooklyAgent:
         model_id: str,
         block: Any,
         adopt_active_order: bool,
+        turn: ModelTurn,
     ) -> tuple[dict[str, Any], ToolOutcome]:
         """Run one requested tool, trace it, and update state from what it returned.
 
@@ -759,6 +907,7 @@ class BooklyAgent:
         started = time.perf_counter()
         outcome = invoke_tool(name, args, state, now=self.clock)
         latency_ms = (time.perf_counter() - started) * 1000
+        turn.tool_latency_ms += round(latency_ms, 2)
 
         # State is updated only from a tool that actually succeeded. A blocked
         # guard or a failed call leaves the session exactly as it was.

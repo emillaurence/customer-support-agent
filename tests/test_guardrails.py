@@ -412,13 +412,7 @@ def test_the_traced_call_never_records_the_token(make_agent, verified_state) -> 
     token = verified_state.pending_returns[0].eligibility_token
     assert token
 
-    agent2, _ = make_agent(
-        tool_call(
-            "initiate_return",
-            {"order_id": IN_WINDOW_ORDER, "item_id": IN_WINDOW_ITEM, "reason": "damaged"},
-        ),
-        text("Your return is open."),
-    )
+    agent2, _ = make_agent(text("Your return is open."))
     agent2.respond(verified_state, "yes please")
 
     traced = "".join(trace.model_dump_json() for trace in verified_state.tool_traces)
