@@ -121,9 +121,9 @@ Order:
 
 **Watch for:**
 
-the physical book on the order is eligible, the ebook on the same order is not, each is decided by its own policy path, and only the eligible item can proceed to a mutation.
+the physical book on the order is eligible, the ebook on the same order is not, each is decided by its own policy path, and only the eligible item can proceed to a mutation. The ebook stays ineligible — the agent does not override policy. If the customer insists on returning it anyway, the agent calls `escalate_to_human` instead of pretending the item can proceed.
 
-![Bruce mixed eligibility](docs/assets/demos/bruce-mixed-eligibility.gif)
+![Bruce mixed eligibility, including escalation when the customer insists on returning the ineligible ebook](docs/assets/demos/bruce-mixed-eligibility.gif)
 
 ### 3. Multiple eligible returns
 
@@ -137,11 +137,11 @@ two separate orders, each checked independently, both surfaced as eligible, a si
 
 ![Kenji multiple eligible returns](docs/assets/demos/kenji-multi-return.gif)
 
-### 4. Policy question
+### 4. Policy lookup
 
 **Try:**
 
-"What is Bookly's return policy in Australia?"
+"What's the policy for Australian customers wanting to return ebooks?" / "How about physical books?"
 
 **Watch for:**
 

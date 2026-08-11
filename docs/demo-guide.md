@@ -44,7 +44,7 @@ Expected flow:
 
 ## 2. Mixed eligibility
 
-**Purpose:** show that eligibility is decided per item, via its own policy path, not per order.
+**Purpose:** show that eligibility is decided per item, via its own policy path, not per order — and that the agent escalates rather than override an ineligible result.
 
 **Identity / order:** verify as Bruce (`bruce@example.com`), then ask about order `ORD-1003`.
 
@@ -52,17 +52,19 @@ Expected outcome:
 - The physical book on the order is eligible (Bruce's AU account gets a regional extended-return policy that covers it).
 - The ebook on the same order is not eligible (ebooks have no return window at all).
 - Only the eligible item is offered for confirmation and can proceed to `initiate_return`.
+- If the customer pushes back and insists on returning the ebook anyway, the agent does not override policy — it calls `escalate_to_human` and creates a case reference instead.
 
 **Watch for:**
 - Both eligibility decisions come from the same policy resolver, evaluated independently per item.
 - One ineligible result in the same turn does not overwrite or cancel the eligible one.
 - The Agent Trace shows each `check_return_eligibility` call with its own policy id and policy path.
+- Insisting on the ebook return doesn't change the outcome or trigger a retry — it routes to `escalate_to_human`.
 
-**Trust/control behaviour:** only the item that clears eligibility can proceed to a mutation; the ineligible item is never offered `initiate_return`.
+**Trust/control behaviour:** only the item that clears eligibility can proceed to a mutation; the ineligible item is never offered `initiate_return`. Pushing on an ineligible item is handled as an exception path — escalation, not an override — which is how the agent stays safe at the boundary of policy.
 
-**GIF:**
+**GIF:** mixed eligibility, including escalation when the customer insists on returning the ineligible ebook.
 
-![Bruce mixed eligibility](assets/demos/bruce-mixed-eligibility.gif)
+![Bruce mixed eligibility, including escalation when the customer insists on returning the ineligible ebook](assets/demos/bruce-mixed-eligibility.gif)
 
 ## 3. Multiple eligible returns
 
@@ -86,11 +88,11 @@ Expected outcome:
 
 ![Kenji multiple eligible returns](assets/demos/kenji-multi-return.gif)
 
-## 4. Policy question
+## 4. Policy lookup
 
 **Purpose:** show a read-only policy lookup that never enters a transactional flow.
 
-**Try:** *"What is Bookly's return policy in Australia?"*
+**Try:** *"What's the policy for Australian customers wanting to return ebooks?"* then *"How about physical books?"*
 
 Expected flow:
 1. The agent calls `search_policy`, which resolves the applicable policy from Neo4j.
