@@ -31,7 +31,7 @@ Outcome: safe to put in front of real customers and real records.
 - Additional customer journeys beyond returns, status, and policy — cancellations, exchanges, address changes, and the escalation paths each of those needs.
 - More markets and regions, extending the policy graph's regional-override model rather than replacing it.
 - Additional channels — email, in-app chat, voice — reusing the same tool contracts against a different front end.
-- An evaluation framework — a fixed set of scenarios (like the three in the [demo guide](demo-guide.md)) run automatically against every change, so a prompt or routing edit can't silently regress a guarded path.
+- An evaluation framework — a fixed set of scenarios (like the four in the [demo guide](demo-guide.md)) run automatically against every change, so a prompt or routing edit can't silently regress a guarded path.
 - Release governance — staged rollout and review for changes to the system prompt, the routing rules, or the policy graph, given how much of the system's behavior lives in each.
 - Latency/cost optimization — tuning the Haiku/Sonnet split and prompt-cache usage against real traffic patterns rather than the fixed keyword lists used here.
 

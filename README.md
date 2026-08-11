@@ -95,25 +95,59 @@ Deterministic Python controls:
 
 [Read the design decisions and tradeoffs](docs/design-decisions.md)
 
-## Suggested demo
+## Demo Scenarios
 
 ### 1. Order discovery and clarification
 
+**Try:**
+
 "I want to return my order"
 
-Watch for: identity collection, automatic order discovery once verified, and a clarifying question only when the item is genuinely ambiguous.
+**Watch for:**
+
+identity collection, automatic order discovery once verified, and a clarifying question only when the item is genuinely ambiguous.
+
+GIF: `docs/assets/demos/order-discovery.gif` *(add the recording to see it rendered here)*
 
 ### 2. Mixed eligibility
 
-Use Bruce (`bruce@example.com`) and order `ORD-1003`.
+Use Bruce:
 
-Watch for: the physical book on the order is eligible, the ebook on the same order is not, each is decided by its own policy path, and only the eligible item can proceed to a mutation.
+`bruce@example.com`
+
+Order:
+
+`ORD-1003`
+
+**Watch for:**
+
+the physical book on the order is eligible, the ebook on the same order is not, each is decided by its own policy path, and only the eligible item can proceed to a mutation.
+
+GIF: `docs/assets/demos/bruce-mixed-eligibility.gif` *(add the recording to see it rendered here)*
 
 ### 3. Multiple eligible returns
 
-Use Kenji (`kenji@example.com`).
+Use Kenji:
 
-Watch for: two separate orders, each checked independently, both surfaced as eligible, a single confirmation that covers both selected returns, and two item-scoped `initiate_return` calls.
+`kenji@example.com`
+
+**Watch for:**
+
+two separate orders, each checked independently, both surfaced as eligible, a single confirmation that covers both selected returns, and two item-scoped `initiate_return` calls.
+
+GIF: `docs/assets/demos/kenji-multi-return.gif` *(add the recording to see it rendered here)*
+
+### 4. Policy question
+
+**Try:**
+
+"What is Bookly's return policy in Australia?"
+
+**Watch for:**
+
+the agent answers using `search_policy`, resolves the applicable policy from Neo4j, explains the policy clearly, and does not enter a transactional return flow or request unnecessary identity verification.
+
+GIF: `docs/assets/demos/policy-question.gif` *(add the recording to see it rendered here)*
 
 Eligibility tokens are never shown to the customer or exposed in Agent Trace; they remain only in trusted server-side state.
 
