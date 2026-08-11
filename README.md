@@ -123,7 +123,7 @@ Order:
 
 the physical book on the order is eligible, the ebook on the same order is not, each is decided by its own policy path, and only the eligible item can proceed to a mutation.
 
-GIF: `docs/assets/demos/bruce-mixed-eligibility.gif` *(add the recording to see it rendered here)*
+![Bruce mixed eligibility](docs/assets/demos/bruce-mixed-eligibility.gif)
 
 ### 3. Multiple eligible returns
 
@@ -135,7 +135,7 @@ Use Kenji:
 
 two separate orders, each checked independently, both surfaced as eligible, a single confirmation that covers both selected returns, and two item-scoped `initiate_return` calls.
 
-GIF: `docs/assets/demos/kenji-multi-return.gif` *(add the recording to see it rendered here)*
+![Kenji multiple eligible returns](docs/assets/demos/kenji-multi-return.gif)
 
 ### 4. Policy question
 
@@ -147,7 +147,7 @@ GIF: `docs/assets/demos/kenji-multi-return.gif` *(add the recording to see it re
 
 the agent answers using `search_policy`, resolves the applicable policy from Neo4j, explains the policy clearly, and does not enter a transactional return flow or request unnecessary identity verification.
 
-GIF: `docs/assets/demos/policy-question.gif` *(add the recording to see it rendered here)*
+![Policy question](docs/assets/demos/policy-question.gif)
 
 Eligibility tokens are never shown to the customer or exposed in Agent Trace; they remain only in trusted server-side state.
 

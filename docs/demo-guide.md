@@ -60,7 +60,9 @@ Expected outcome:
 
 **Trust/control behaviour:** only the item that clears eligibility can proceed to a mutation; the ineligible item is never offered `initiate_return`.
 
-**GIF:** `assets/demos/bruce-mixed-eligibility.gif`
+**GIF:**
+
+![Bruce mixed eligibility](assets/demos/bruce-mixed-eligibility.gif)
 
 ## 3. Multiple eligible returns
 
@@ -80,7 +82,9 @@ Expected outcome:
 
 **Trust/control behaviour:** two item-scoped `initiate_return` calls, each requiring its own eligibility token and confirmation — no shared or implicit authorization between them.
 
-**GIF:** `assets/demos/kenji-multi-return.gif`
+**GIF:**
+
+![Kenji multiple eligible returns](assets/demos/kenji-multi-return.gif)
 
 ## 4. Policy question
 
@@ -99,7 +103,9 @@ Expected flow:
 
 **Trust/control behaviour:** a purely informational question stays informational — no eligibility token is created, and no transactional tool is called.
 
-**GIF:** `assets/demos/policy-question.gif`
+**GIF:**
+
+![Policy question](assets/demos/policy-question.gif)
 
 ## Agent Trace
 
